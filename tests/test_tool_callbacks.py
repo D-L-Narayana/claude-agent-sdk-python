@@ -924,6 +924,90 @@ class TestHookEventCallbacks:
         assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
 
 
+class TestSessionLifecycleHookCallbacks:
+    """SessionStart/SessionEnd hooks are registered and dispatched like any other."""
+
+    @pytest.mark.anyio
+    async def test_session_start_hook_reaches_initialize_and_is_dispatched(self):
+        from unittest.mock import patch
+
+        from claude_agent_sdk.types import _hooks_to_internal_format
+
+        seen: list[dict[str, Any]] = []
+
+        async def session_start_hook(
+            input_data: HookInput, tool_use_id: str | None, context: HookContext
+        ) -> HookJSONOutput:
+            seen.append(dict(input_data))
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "resumed after a long pause",
+                }
+            }
+
+        options = ClaudeAgentOptions(
+            hooks={"SessionStart": [HookMatcher(hooks=[session_start_hook])]}
+        )
+        transport = MockTransport()
+        query = Query(
+            transport=transport,
+            is_streaming_mode=True,
+            can_use_tool=None,
+            hooks=_hooks_to_internal_format(options.hooks or {}),
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_send(request: dict[str, Any], timeout: float) -> dict:
+            captured.update(request)
+            return {"commands": []}
+
+        with patch.object(query, "_send_control_request", side_effect=fake_send):
+            await query.initialize()
+
+        # The initialize request advertises the SessionStart matcher to the CLI.
+        assert list(captured["hooks"]) == ["SessionStart"]
+        (callback_id,) = captured["hooks"]["SessionStart"][0]["hookCallbackIds"]
+
+        # A hook_callback for that id runs the Python callback with the CLI's input.
+        await query._handle_control_request(
+            {
+                "type": "control_request",
+                "request_id": "req-session-start",
+                "request": {
+                    "subtype": "hook_callback",
+                    "callback_id": callback_id,
+                    "input": {
+                        "session_id": "sess-1",
+                        "transcript_path": "/tmp/t",
+                        "cwd": "/work",
+                        "hook_event_name": "SessionStart",
+                        "source": "resume",
+                        "seconds_since_last_response": 900,
+                    },
+                    "tool_use_id": None,
+                },
+            }
+        )
+
+        assert seen == [
+            {
+                "session_id": "sess-1",
+                "transcript_path": "/tmp/t",
+                "cwd": "/work",
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "seconds_since_last_response": 900,
+            }
+        ]
+        response = json.loads(transport.written_messages[-1])["response"]
+        assert response["response"]["hookSpecificOutput"] == {
+            "hookEventName": "SessionStart",
+            "additionalContext": "resumed after a long pause",
+        }
+
+
 class TestHookInitializeRegistration:
     """Test that new hook events can be registered through the initialize flow."""
 

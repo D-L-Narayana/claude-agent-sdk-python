@@ -11,10 +11,15 @@ from claude_agent_sdk import (
     PermissionRequestHookInput,
     PermissionRequestHookSpecificOutput,
     ResultMessage,
+    SessionEndHookInput,
+    SessionStartHookInput,
+    SessionStartHookSpecificOutput,
     SubagentStartHookInput,
     SubagentStartHookSpecificOutput,
 )
 from claude_agent_sdk.types import (
+    HookEvent,
+    HookInput,
     PermissionRuleValue,
     PermissionUpdate,
     PostToolUseHookSpecificOutput,
@@ -403,8 +408,103 @@ class TestHookInputTypes:
         assert len(hook_input["permission_suggestions"]) == 1
 
 
+# The hook events the CLI fires, as listed by the TypeScript SDK's ``HookEvent``
+# union (``@anthropic-ai/claude-agent-sdk`` 0.3.283, ``sdk.d.ts``).
+CLI_HOOK_EVENTS = {
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Notification",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "PreModelSwitch",
+    "PostModelSwitch",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Setup",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
+    "Elicitation",
+    "ElicitationResult",
+    "ConfigChange",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "InstructionsLoaded",
+    "CwdChanged",
+    "FileChanged",
+    "DirectoryAdded",
+    "MessageDisplay",
+}
+
+
+class TestHookEventLiteral:
+    """HookEvent names every event the CLI can dispatch to an SDK hook."""
+
+    def test_hook_event_matches_cli_events(self):
+        assert set(get_args(HookEvent)) == CLI_HOOK_EVENTS
+
+    def test_hook_event_has_no_duplicates(self):
+        names = get_args(HookEvent)
+        assert len(names) == len(set(names))
+
+    def test_every_typed_hook_input_names_a_hook_event(self):
+        """Each ``*HookInput`` TypedDict discriminates on a registrable event."""
+        for hook_input in get_args(HookInput):
+            (event,) = get_args(hook_input.__annotations__["hook_event_name"])
+            assert event in CLI_HOOK_EVENTS, hook_input.__name__
+
+    def test_session_start_hook_input(self):
+        hook_input: SessionStartHookInput = {
+            "session_id": "sess-1",
+            "transcript_path": "/tmp/transcript",
+            "cwd": "/work",
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "model": "claude-sonnet-4-5",
+            "seconds_since_last_response": 42.5,
+            "context_tokens": 1200,
+            "prompt_cache_likely_expired": True,
+        }
+        assert hook_input["hook_event_name"] == "SessionStart"
+        assert hook_input["source"] == "resume"
+        assert hook_input["context_tokens"] == 1200
+
+    def test_session_end_hook_input(self):
+        hook_input: SessionEndHookInput = {
+            "session_id": "sess-1",
+            "transcript_path": "/tmp/transcript",
+            "cwd": "/work",
+            "hook_event_name": "SessionEnd",
+            "reason": "prompt_input_exit",
+        }
+        assert hook_input["hook_event_name"] == "SessionEnd"
+        assert hook_input["reason"] == "prompt_input_exit"
+
+
 class TestHookSpecificOutputTypes:
     """Test hook-specific output type definitions."""
+
+    def test_session_start_hook_specific_output(self):
+        output: SessionStartHookSpecificOutput = {
+            "hookEventName": "SessionStart",
+            "additionalContext": "Repo uses uv; run tests with `uv run pytest`.",
+            "sessionTitle": "Fix flaky tests",
+            "watchPaths": ["src/"],
+            "reloadSkills": True,
+        }
+        assert output["hookEventName"] == "SessionStart"
+        assert output["watchPaths"] == ["src/"]
+        assert output["reloadSkills"] is True
 
     def test_notification_hook_specific_output(self):
         """Test NotificationHookSpecificOutput construction."""

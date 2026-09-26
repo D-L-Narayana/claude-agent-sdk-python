@@ -281,18 +281,45 @@ CanUseTool = Callable[
 
 
 ##### Hook types
-HookEvent = (
-    Literal["PreToolUse"]
-    | Literal["PostToolUse"]
-    | Literal["PostToolUseFailure"]
-    | Literal["UserPromptSubmit"]
-    | Literal["Stop"]
-    | Literal["SubagentStop"]
-    | Literal["PreCompact"]
-    | Literal["Notification"]
-    | Literal["SubagentStart"]
-    | Literal["PermissionRequest"]
-)
+# Every hook event the CLI fires. Kept in sync with ``HookEvent`` in the
+# TypeScript SDK (``@anthropic-ai/claude-agent-sdk``, ``sdk.d.ts``). Registration
+# is not restricted at runtime: whatever keys ``ClaudeAgentOptions.hooks`` holds
+# are sent in the initialize request, so this literal is what type checkers see.
+HookEvent = Literal[
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Notification",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "PreModelSwitch",
+    "PostModelSwitch",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Setup",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
+    "Elicitation",
+    "ElicitationResult",
+    "ConfigChange",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "InstructionsLoaded",
+    "CwdChanged",
+    "FileChanged",
+    "DirectoryAdded",
+    "MessageDisplay",
+]
 
 
 # Hook input types - strongly typed for each hook event
@@ -418,12 +445,43 @@ class PermissionRequestHookInput(BaseHookInput, _SubagentContextMixin):
     permission_suggestions: NotRequired[list[Any]]
 
 
-# Union type for all hook inputs
+class SessionStartHookInput(BaseHookInput):
+    """Input data for SessionStart hook events.
+
+    The ``seconds_since_last_response``, ``context_tokens``,
+    ``prompt_cache_likely_expired`` and ``estimated_cache_write_usd`` fields are
+    only present when ``source`` is ``"resume"`` or ``"fork"``.
+    """
+
+    hook_event_name: Literal["SessionStart"]
+    source: Literal["startup", "resume", "clear", "compact", "fork"]
+    agent_type: NotRequired[str]
+    model: NotRequired[str]
+    session_title: NotRequired[str]
+    seconds_since_last_response: NotRequired[float]
+    context_tokens: NotRequired[int]
+    prompt_cache_likely_expired: NotRequired[bool]
+    estimated_cache_write_usd: NotRequired[float]
+
+
+class SessionEndHookInput(BaseHookInput):
+    """Input data for SessionEnd hook events."""
+
+    hook_event_name: Literal["SessionEnd"]
+    reason: Literal["clear", "resume", "logout", "prompt_input_exit", "other"]
+
+
+# Union type for all hook inputs.
+#
+# Events in ``HookEvent`` without a TypedDict here still reach the callback;
+# they arrive as the plain dict the CLI sent.
 HookInput = (
     PreToolUseHookInput
     | PostToolUseHookInput
     | PostToolUseFailureHookInput
     | UserPromptSubmitHookInput
+    | SessionStartHookInput
+    | SessionEndHookInput
     | StopHookInput
     | SubagentStopHookInput
     | PreCompactHookInput
@@ -481,6 +539,10 @@ class SessionStartHookSpecificOutput(TypedDict):
 
     hookEventName: Literal["SessionStart"]
     additionalContext: NotRequired[str]
+    initialUserMessage: NotRequired[str]
+    sessionTitle: NotRequired[str]
+    watchPaths: NotRequired[list[str]]
+    reloadSkills: NotRequired[bool]
 
 
 class NotificationHookSpecificOutput(TypedDict):
