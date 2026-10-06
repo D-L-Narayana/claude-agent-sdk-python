@@ -2,9 +2,10 @@
 .git
 .gitignore
 
-# Python
-__pycache__
-*.py[cod]
+# Python. Dockerignore patterns are anchored to the build context root, so a
+# bare `__pycache__` only matches the root one; `**/` matches at any depth.
+**/__pycache__
+**/*.py[cod]
 *$py.class
 *.so
 .Python
@@ -39,10 +40,24 @@ ENV/
 
 # Testing/Coverage
 .coverage
+.coverage.*
+coverage.xml
 .pytest_cache/
 htmlcov/
 .tox/
 .nox/
+
+# Linting/Type checking
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Local env files (live-backend test credentials etc.): never into an image layer
+.env.*
+
+# Claude Code worktrees (full checkouts; see .gitignore)
+.claude/worktrees/
 
 # Misc
 *.log

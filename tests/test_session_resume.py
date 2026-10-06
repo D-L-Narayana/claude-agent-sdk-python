@@ -609,6 +609,76 @@ class TestSubkeyMaterialization:
         await m.cleanup()
 
     @pytest.mark.anyio
+    async def test_write_session_subkeys_is_the_shared_writer(
+        self, tmp_path: Path, project_key: str
+    ) -> None:
+        """``_materialize_subkeys`` is a thin wrapper over
+        ``_write_session_subkeys``, which writes the CLI subagent layout into
+        any session directory (the export path points it at a staging dir)
+        and names its caller in timeout errors via ``phase``."""
+        from claude_agent_sdk._internal.session_resume import (
+            _materialize_subkeys,
+            _write_session_subkeys,
+        )
+
+        store = InMemorySessionStore()
+        sub_key: SessionKey = {
+            "project_key": project_key,
+            "session_id": SESSION_ID,
+            "subpath": "subagents/agent-abc",
+        }
+        await store.append(
+            sub_key,
+            [
+                {"type": "user", "uuid": "su1"},
+                {"type": "agent_metadata", "agentType": "general"},
+            ],
+        )
+
+        session_dir = tmp_path / "anywhere" / SESSION_ID
+        await _write_session_subkeys(store, session_dir, project_key, SESSION_ID, 5.0)
+        jsonl = session_dir / "subagents" / "agent-abc.jsonl"
+        meta = session_dir / "subagents" / "agent-abc.meta.json"
+        assert [json.loads(ln) for ln in jsonl.read_text().splitlines()] == [
+            {"type": "user", "uuid": "su1"}
+        ]
+        assert json.loads(meta.read_text()) == {"agentType": "general"}
+        if os.name != "nt":
+            assert (jsonl.stat().st_mode & 0o777) == 0o600
+            assert (meta.stat().st_mode & 0o777) == 0o600
+
+        # The wrapper keeps its signature and lands in project_dir/<sid>/.
+        project_dir = tmp_path / "wrapped" / "projects" / project_key
+        await _materialize_subkeys(
+            store, tmp_path / "wrapped", project_dir, project_key, SESSION_ID, 5.0
+        )
+        wrapped = project_dir / SESSION_ID / "subagents" / "agent-abc.jsonl"
+        assert wrapped.read_text() == jsonl.read_text()
+
+        class HungSubkeysStore(InMemorySessionStore):
+            async def list_subkeys(self, key):  # type: ignore[override]
+                await anyio.sleep(3600)
+                return []
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"list_subkeys\(\).*timed out after 50ms during unit test",
+        ):
+            await _write_session_subkeys(
+                HungSubkeysStore(),
+                session_dir,
+                project_key,
+                SESSION_ID,
+                0.05,
+                phase="unit test",
+            )
+        # The default phase keeps the resume path's wording.
+        with pytest.raises(RuntimeError, match="during resume materialization"):
+            await _write_session_subkeys(
+                HungSubkeysStore(), session_dir, project_key, SESSION_ID, 0.05
+            )
+
+    @pytest.mark.anyio
     async def test_traversal_guards(
         self, cwd: Path, project_key: str, isolated_home: Path
     ) -> None:

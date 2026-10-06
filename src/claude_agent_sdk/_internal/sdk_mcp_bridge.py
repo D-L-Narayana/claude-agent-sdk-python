@@ -19,24 +19,36 @@ the server and the cause. Only a new ``initialize`` starts the server again,
 and the CLI sends one only for a server whose handshake failed (it retries
 those every turn); a server that dies after a good handshake stays down for
 the rest of the query, as with the TypeScript SDK.
+
+The configured server may be a lowlevel ``mcp.server.Server`` or a
+high-level one (``FastMCP`` on mcp 1.x, ``MCPServer`` on mcp 2.x);
+``resolve_server`` finds the lowlevel server that is actually run. Traffic
+the server initiates is handled here rather than carried to the CLI: its
+log messages are forwarded to Python logging under
+``claude_agent_sdk.mcp.<server name>``, progress is logged there at DEBUG,
+and its requests (sampling, elicitation, roots) are refused.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 import anyio
 import anyio.abc
+from mcp.server import Server as McpServer
 from mcp.shared.memory import create_client_server_memory_streams
 from mcp.shared.message import SessionMessage
 
-from ._mcp_compat import can_cancel_requests, dump_jsonrpc, parse_jsonrpc
+from ._mcp_compat import (
+    LOWLEVEL_SERVER_ATTRIBUTES,
+    can_cancel_requests,
+    dump_jsonrpc,
+    parse_jsonrpc,
+)
 from ._task_compat import TaskHandle, spawn_detached
-
-if TYPE_CHECKING:
-    from mcp.server import Server as McpServer
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +61,104 @@ SHUTDOWN_GRACE_SECONDS = 5.0
 # JSON-RPC "method not found": what a client answers for a request it does
 # not support.
 _METHOD_NOT_FOUND = -32601
+
+# Log messages an SDK MCP server sends to its client are forwarded to the
+# Python logger ``<MCP_SERVER_LOGGER_PREFIX>.<server name>``.
+MCP_SERVER_LOGGER_PREFIX = "claude_agent_sdk.mcp"
+
+# MCP log levels (the RFC 5424 scale) to Python logging levels.
+_LOG_LEVELS: dict[str, int] = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "notice": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "critical": logging.CRITICAL,
+    "alert": logging.CRITICAL,
+    "emergency": logging.CRITICAL,
+}
+
+
+def resolve_server(instance: Any) -> McpServer:
+    """Return the lowlevel ``mcp.server.Server`` behind an SDK server config's ``instance``.
+
+    A lowlevel ``Server`` is returned as is. A high-level server (``FastMCP``
+    on mcp 1.x, ``MCPServer`` on mcp 2.x, or anything else that keeps a
+    lowlevel ``Server`` under the same attribute names) is unwrapped to the
+    server it drives, which is what gets served. Anything else raises
+    ``TypeError``.
+    """
+    if isinstance(instance, McpServer):
+        return instance
+    # Only these attributes are read: the high-level classes have others
+    # (an HTTP session manager, say) that raise until they are set up.
+    for attribute in LOWLEVEL_SERVER_ATTRIBUTES:
+        with suppress(Exception):
+            inner = getattr(instance, attribute, None)
+            if isinstance(inner, McpServer):
+                return inner
+    raise TypeError(
+        "An SDK MCP server's instance must be an mcp.server.Server, a FastMCP "
+        f"(mcp 1.x) or an MCPServer (mcp 2.x); got {type(instance).__name__}"
+    )
+
+
+def _server_logger(server_name: str) -> logging.Logger:
+    return logging.getLogger(f"{MCP_SERVER_LOGGER_PREFIX}.{server_name}")
+
+
+def _render(data: Any) -> str:
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data)
+    except (TypeError, ValueError):
+        return repr(data)
+
+
+def _log_server_message(server_name: str, params: dict[str, Any]) -> None:
+    """Forward a ``notifications/message`` from the server to Python logging.
+
+    The record carries the raw notification fields as ``mcp_server``,
+    ``mcp_level``, ``mcp_logger`` and ``mcp_data`` for structured handlers.
+    """
+    level = params.get("level")
+    source = params.get("logger")
+    data = params.get("data")
+    level_no = _LOG_LEVELS.get(str(level), logging.INFO)
+    server_logger = _server_logger(server_name)
+    if not server_logger.isEnabledFor(level_no):
+        return
+    extra = {
+        "mcp_server": server_name,
+        "mcp_level": level,
+        "mcp_logger": source,
+        "mcp_data": data,
+    }
+    if source:
+        server_logger.log(level_no, "%s: %s", source, _render(data), extra=extra)
+    else:
+        server_logger.log(level_no, "%s", _render(data), extra=extra)
+
+
+def _log_server_progress(server_name: str, params: dict[str, Any]) -> None:
+    """Log a ``notifications/progress`` from the server at DEBUG."""
+    progress = params.get("progress")
+    total = params.get("total")
+    message = params.get("message")
+    _server_logger(server_name).debug(
+        "Progress %s%s%s",
+        progress,
+        "" if total is None else f"/{total}",
+        f": {message}" if message else "",
+        extra={
+            "mcp_server": server_name,
+            "mcp_progress": progress,
+            "mcp_total": total,
+            "mcp_progress_token": params.get("progressToken"),
+            "mcp_message": message,
+        },
+    )
 
 
 class _SendStream(Protocol):
@@ -106,9 +216,11 @@ class _Session:
     Runs as a single detached task that owns the streams, the server, and the
     only reader of the server's output, and ends when ``Server.run`` returns.
     Responses are matched to waiting requests by JSON-RPC id. Nothing carries
-    server-initiated traffic to the CLI yet: notifications (logging, progress,
-    list_changed) are dropped, and requests (roots, sampling, elicitation) are
-    refused so the server's caller fails at once instead of waiting forever.
+    server-initiated traffic to the CLI yet: log messages are forwarded to
+    Python logging and progress is logged at DEBUG, other notifications
+    (list_changed) are dropped, and requests (roots, sampling, elicitation)
+    are refused so the server's caller fails at once instead of waiting
+    forever.
     """
 
     def __init__(self, name: str, server: McpServer) -> None:
@@ -208,10 +320,24 @@ class _Session:
             assert self._tasks is not None
             self._tasks.start_soon(self._answer_server_request, payload)
         else:
+            self._on_notification(payload)
+
+    def _on_notification(self, payload: dict[str, Any]) -> None:
+        """Handle a notification the server sent to the client.
+
+        Log messages go to the Python logger for this server and progress
+        is logged there at DEBUG. Nothing carries other notifications
+        (list_changed, resource updates) to the CLI yet; they are dropped.
+        """
+        method = payload["method"]
+        params = payload.get("params") or {}
+        if method == "notifications/message":
+            _log_server_message(self._name, params)
+        elif method == "notifications/progress":
+            _log_server_progress(self._name, params)
+        else:
             logger.debug(
-                "Dropping %r notification from SDK MCP server %r",
-                payload["method"],
-                self._name,
+                "Dropping %r notification from SDK MCP server %r", method, self._name
             )
 
     async def _answer_server_request(self, request: dict[str, Any]) -> None:
@@ -341,11 +467,16 @@ class _Session:
 
 
 class SdkMcpBridge:
-    """Routes raw JSON-RPC for one in-process MCP server through mcp's memory transport."""
+    """Routes raw JSON-RPC for one in-process MCP server through mcp's memory transport.
 
-    def __init__(self, name: str, server: McpServer) -> None:
+    ``server`` is a lowlevel ``mcp.server.Server`` or a high-level server
+    wrapping one (see ``resolve_server``); the lowlevel server is what runs.
+    Anything else raises ``TypeError`` here, before any message is handled.
+    """
+
+    def __init__(self, name: str, server: Any) -> None:
         self.name = name
-        self._server = server
+        self._server = resolve_server(server)
         self._session: _Session | None = None
         self._closed = False
 

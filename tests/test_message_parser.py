@@ -1,5 +1,7 @@
 """Tests for message parser error handling."""
 
+from typing import Any, get_args
+
 import pytest
 
 from claude_agent_sdk._errors import MessageParseError
@@ -7,13 +9,20 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import (
     TERMINAL_TASK_STATUSES,
     AssistantMessage,
+    AuthStatusMessage,
+    CompactBoundaryMessage,
     ConversationResetMessage,
     DeferredToolUse,
     HookEventMessage,
+    InitMessage,
+    MirrorErrorMessage,
     RateLimitEvent,
+    RedactedThinkingBlock,
     ResultMessage,
+    ServerToolName,
     ServerToolResultBlock,
     ServerToolUseBlock,
+    StatusMessage,
     SystemMessage,
     TaskNotificationMessage,
     TaskProgressMessage,
@@ -21,8 +30,11 @@ from claude_agent_sdk.types import (
     TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
+    ToolProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseSummaryMessage,
+    UnknownBlock,
     UserMessage,
 )
 
@@ -1356,3 +1368,1014 @@ class TestMessageParser:
         assert message.hook_event_name == "Stop"
         assert message.session_id is None
         assert message.uuid is None
+
+
+# ---------------------------------------------------------------------------
+# Message model fidelity: typed system subtypes, new top-level message types,
+# and content blocks that are never dropped.
+# ---------------------------------------------------------------------------
+
+# The ``init`` frame as emitted by current Claude Code CLIs (wire spellings).
+REALISTIC_INIT_FRAME: dict[str, Any] = {
+    "type": "system",
+    "subtype": "init",
+    "cwd": "/home/dev/project",
+    "session_id": "8f1c2a4e-5b6d-4c7e-9f0a-1b2c3d4e5f60",
+    "tools": ["Task", "Bash", "Glob", "Grep", "Read", "Edit", "Write", "WebFetch"],
+    "mcp_servers": [{"name": "filesystem", "status": "connected"}],
+    "model": "claude-sonnet-4-5-20250929",
+    "permissionMode": "acceptEdits",
+    "slash_commands": ["compact", "context", "cost", "review"],
+    "apiKeySource": "none",
+    "claude_code_version": "2.1.283",
+    "output_style": "default",
+    "agents": ["general-purpose", "Explore", "Plan"],
+    "skills": ["commit", "pr-review"],
+    "plugins": [{"name": "my-plugin", "path": "/home/dev/.claude/plugins/my-plugin"}],
+    "betas": ["context-1m-2025-08-07"],
+    "uuid": "0d1e2f3a-4b5c-6d7e-8f90-a1b2c3d4e5f6",
+}
+
+# The minimal ``init`` frame the fake CLIs in the test-suite emit; they later
+# read ``init.data[...]`` so the raw frame must stay attached.
+MINIMAL_INIT_FRAME: dict[str, Any] = {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "model": "m",
+    "cwd": ".",
+    "tools": [],
+    "mcp_servers": [],
+    "permissionMode": "default",
+    "apiKeySource": "none",
+    "fake_env": {"CLAUDE_CODE_SDK_READS_SESSION_STATE": None},
+}
+
+TOOL_PROGRESS_FRAME: dict[str, Any] = {
+    "type": "tool_progress",
+    "tool_use_id": "toolu_01ABC",
+    "tool_name": "Bash",
+    "parent_tool_use_id": None,
+    "elapsed_time_seconds": 12.5,
+    "uuid": "tp-uuid-1",
+    "session_id": "sess-1",
+}
+
+
+def _assistant_frame(*blocks: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "message": {"content": list(blocks), "model": "claude-sonnet-4-5"},
+    }
+
+
+def _user_frame(*blocks: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "user", "message": {"content": list(blocks)}}
+
+
+class TestInitMessage:
+    """``system``/``init`` frames parse into a typed InitMessage."""
+
+    def test_parse_realistic_init_frame(self):
+        message = parse_message(dict(REALISTIC_INIT_FRAME))
+        assert isinstance(message, InitMessage)
+        assert message.subtype == "init"
+        assert message.data == REALISTIC_INIT_FRAME
+        assert message.session_id == "8f1c2a4e-5b6d-4c7e-9f0a-1b2c3d4e5f60"
+        assert message.model == "claude-sonnet-4-5-20250929"
+        assert message.cwd == "/home/dev/project"
+        assert message.tools == [
+            "Task",
+            "Bash",
+            "Glob",
+            "Grep",
+            "Read",
+            "Edit",
+            "Write",
+            "WebFetch",
+        ]
+        assert message.mcp_servers == [{"name": "filesystem", "status": "connected"}]
+        assert message.permission_mode == "acceptEdits"
+        assert message.api_key_source == "none"
+        assert message.slash_commands == ["compact", "context", "cost", "review"]
+        assert message.agents == ["general-purpose", "Explore", "Plan"]
+        assert message.skills == ["commit", "pr-review"]
+        assert message.plugins == [
+            {"name": "my-plugin", "path": "/home/dev/.claude/plugins/my-plugin"}
+        ]
+        assert message.output_style == "default"
+        assert message.claude_code_version == "2.1.283"
+        assert message.betas == ["context-1m-2025-08-07"]
+        assert message.uuid == "0d1e2f3a-4b5c-6d7e-8f90-a1b2c3d4e5f6"
+
+    def test_parse_init_frame_snake_case_spellings(self):
+        """permission_mode / api_key_source are accepted alongside the camelCase wire keys."""
+        frame = {
+            key: value
+            for key, value in REALISTIC_INIT_FRAME.items()
+            if key not in ("permissionMode", "apiKeySource")
+        }
+        frame["permission_mode"] = "plan"
+        frame["api_key_source"] = "user"
+        message = parse_message(frame)
+        assert isinstance(message, InitMessage)
+        assert message.permission_mode == "plan"
+        assert message.api_key_source == "user"
+
+    def test_camel_case_spelling_wins_when_both_present(self):
+        frame = {**REALISTIC_INIT_FRAME, "permission_mode": "plan"}
+        message = parse_message(frame)
+        assert isinstance(message, InitMessage)
+        assert message.permission_mode == "acceptEdits"
+
+    def test_parse_minimal_init_frame_from_fake_cli(self):
+        """The few-key frame the fake CLIs emit parses, keeping the raw frame on .data."""
+        message = parse_message(dict(MINIMAL_INIT_FRAME))
+        assert isinstance(message, InitMessage)
+        assert message.session_id == "s"
+        assert message.model == "m"
+        assert message.cwd == "."
+        assert message.tools == []
+        assert message.mcp_servers == []
+        assert message.permission_mode == "default"
+        assert message.api_key_source == "none"
+        assert message.slash_commands == []
+        assert message.agents == []
+        assert message.skills == []
+        assert message.plugins == []
+        assert message.betas == []
+        assert message.output_style is None
+        assert message.claude_code_version is None
+        assert message.uuid is None
+        assert message.data["fake_env"] == {"CLAUDE_CODE_SDK_READS_SESSION_STATE": None}
+
+    def test_parse_bare_init_frame_uses_defaults(self):
+        """An init frame with no keys beyond type/subtype never raises."""
+        data = {"type": "system", "subtype": "init"}
+        message = parse_message(data)
+        assert isinstance(message, InitMessage)
+        assert message.data == data
+        assert message.session_id is None
+        assert message.model is None
+        assert message.cwd is None
+        assert message.permission_mode is None
+        assert message.api_key_source is None
+        assert message.tools == []
+        assert message.mcp_servers == []
+        assert message.slash_commands == []
+        assert message.agents == []
+        assert message.skills == []
+        assert message.plugins == []
+        assert message.betas == []
+
+    @pytest.mark.parametrize("bad", [None, "Bash", 3, {"name": "Bash"}])
+    def test_non_list_collections_fall_back_to_empty(self, bad):
+        frame = {
+            "type": "system",
+            "subtype": "init",
+            "tools": bad,
+            "mcp_servers": bad,
+            "slash_commands": bad,
+            "agents": bad,
+            "skills": bad,
+            "plugins": bad,
+            "betas": bad,
+        }
+        message = parse_message(frame)
+        assert isinstance(message, InitMessage)
+        assert message.tools == []
+        assert message.mcp_servers == []
+        assert message.slash_commands == []
+        assert message.agents == []
+        assert message.skills == []
+        assert message.plugins == []
+        assert message.betas == []
+        # The raw value is still visible on the frame.
+        assert message.data["tools"] == bad
+
+    @pytest.mark.parametrize("bad", [None, 7, ["default"]])
+    def test_non_string_scalars_fall_back_to_none(self, bad):
+        frame = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": bad,
+            "model": bad,
+            "cwd": bad,
+            "permissionMode": bad,
+            "apiKeySource": bad,
+            "output_style": bad,
+            "claude_code_version": bad,
+            "uuid": bad,
+        }
+        message = parse_message(frame)
+        assert isinstance(message, InitMessage)
+        assert message.session_id is None
+        assert message.model is None
+        assert message.cwd is None
+        assert message.permission_mode is None
+        assert message.api_key_source is None
+        assert message.output_style is None
+        assert message.claude_code_version is None
+        assert message.uuid is None
+
+    def test_agents_descriptor_dicts_pass_through(self):
+        """Some CLI versions send agent descriptor objects instead of names."""
+        agents = [{"name": "reviewer", "description": "Reviews PRs"}]
+        frame = {"type": "system", "subtype": "init", "agents": agents}
+        message = parse_message(frame)
+        assert isinstance(message, InitMessage)
+        assert message.agents == agents
+
+    def test_init_message_is_system_message(self):
+        message = parse_message(dict(REALISTIC_INIT_FRAME))
+        assert isinstance(message, SystemMessage)
+        matched = False
+        match message:
+            case SystemMessage():
+                matched = True
+        assert matched
+
+
+class TestCompactBoundaryMessage:
+    """``system``/``compact_boundary`` frames parse into CompactBoundaryMessage."""
+
+    def test_parse_compact_boundary_with_metadata(self):
+        data = {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"trigger": "auto", "pre_tokens": 154_321},
+            "uuid": "cb-uuid-1",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, CompactBoundaryMessage)
+        assert message.subtype == "compact_boundary"
+        assert message.trigger == "auto"
+        assert message.pre_tokens == 154_321
+        assert message.session_id == "sess-1"
+        assert message.uuid == "cb-uuid-1"
+        assert message.data == data
+
+    def test_parse_compact_boundary_manual_trigger(self):
+        data = {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"trigger": "manual", "pre_tokens": 42},
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, CompactBoundaryMessage)
+        assert message.trigger == "manual"
+        assert message.pre_tokens == 42
+        assert message.uuid is None
+
+    def test_parse_compact_boundary_without_metadata(self):
+        data = {"type": "system", "subtype": "compact_boundary", "session_id": "s"}
+        message = parse_message(data)
+        assert isinstance(message, CompactBoundaryMessage)
+        assert message.trigger is None
+        assert message.pre_tokens is None
+        assert message.session_id == "s"
+        assert message.uuid is None
+        assert message.data == data
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            "auto",
+            ["auto"],
+            {"trigger": 1, "pre_tokens": "many"},
+            {"pre_tokens": True},
+        ],
+    )
+    def test_malformed_metadata_never_raises(self, metadata):
+        data = {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": metadata,
+        }
+        message = parse_message(data)
+        assert isinstance(message, CompactBoundaryMessage)
+        assert message.trigger is None
+        assert message.pre_tokens is None
+        assert message.data["compact_metadata"] == metadata
+
+    def test_compact_boundary_is_system_message(self):
+        message = parse_message({"type": "system", "subtype": "compact_boundary"})
+        assert isinstance(message, SystemMessage)
+        matched = False
+        match message:
+            case SystemMessage():
+                matched = True
+        assert matched
+
+
+class TestStatusMessage:
+    """``system``/``status`` frames parse into StatusMessage."""
+
+    def test_parse_status_compacting(self):
+        data = {
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+            "uuid": "st-uuid-1",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, StatusMessage)
+        assert message.subtype == "status"
+        assert message.status == "compacting"
+        assert message.permission_mode is None
+        assert message.uuid == "st-uuid-1"
+        assert message.session_id == "sess-1"
+        assert message.data == data
+
+    def test_parse_status_cleared(self):
+        """The CLI sends status=null once compaction finishes."""
+        data = {
+            "type": "system",
+            "subtype": "status",
+            "status": None,
+            "uuid": "st-uuid-2",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, StatusMessage)
+        assert message.status is None
+        assert message.data == data
+
+    @pytest.mark.parametrize("key", ["permissionMode", "permission_mode"])
+    def test_parse_status_permission_mode_spellings(self, key):
+        data = {
+            "type": "system",
+            "subtype": "status",
+            "status": None,
+            key: "plan",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, StatusMessage)
+        assert message.permission_mode == "plan"
+
+    def test_parse_status_minimal(self):
+        message = parse_message({"type": "system", "subtype": "status"})
+        assert isinstance(message, StatusMessage)
+        assert message.status is None
+        assert message.permission_mode is None
+        assert message.session_id is None
+        assert message.uuid is None
+
+    def test_status_is_system_message(self):
+        message = parse_message({"type": "system", "subtype": "status"})
+        assert isinstance(message, SystemMessage)
+        matched = False
+        match message:
+            case SystemMessage():
+                matched = True
+        assert matched
+
+
+class TestToolProgressMessage:
+    """Top-level ``tool_progress`` frames parse into ToolProgressMessage."""
+
+    def test_parse_tool_progress(self):
+        message = parse_message(dict(TOOL_PROGRESS_FRAME))
+        assert isinstance(message, ToolProgressMessage)
+        assert message.tool_use_id == "toolu_01ABC"
+        assert message.tool_name == "Bash"
+        assert message.elapsed_time_seconds == 12.5
+        assert message.parent_tool_use_id is None
+        assert message.uuid == "tp-uuid-1"
+        assert message.session_id == "sess-1"
+        assert message.data == TOOL_PROGRESS_FRAME
+
+    def test_parse_tool_progress_inside_subagent(self):
+        frame = {**TOOL_PROGRESS_FRAME, "parent_tool_use_id": "toolu_parent"}
+        message = parse_message(frame)
+        assert isinstance(message, ToolProgressMessage)
+        assert message.parent_tool_use_id == "toolu_parent"
+
+    def test_integer_elapsed_time_becomes_float(self):
+        frame = {**TOOL_PROGRESS_FRAME, "elapsed_time_seconds": 3}
+        message = parse_message(frame)
+        assert isinstance(message, ToolProgressMessage)
+        assert message.elapsed_time_seconds == 3.0
+        assert isinstance(message.elapsed_time_seconds, float)
+
+    def test_tool_progress_without_optional_ids(self):
+        frame = {
+            "type": "tool_progress",
+            "tool_use_id": "toolu_01ABC",
+            "tool_name": "Read",
+            "elapsed_time_seconds": 0.25,
+        }
+        message = parse_message(frame)
+        assert isinstance(message, ToolProgressMessage)
+        assert message.parent_tool_use_id is None
+        assert message.uuid is None
+        assert message.session_id is None
+
+    def test_tool_progress_without_tool_use_id_is_skipped(self):
+        frame = {k: v for k, v in TOOL_PROGRESS_FRAME.items() if k != "tool_use_id"}
+        assert parse_message(frame) is None
+
+    def test_tool_progress_without_tool_name_is_skipped(self):
+        frame = {k: v for k, v in TOOL_PROGRESS_FRAME.items() if k != "tool_name"}
+        assert parse_message(frame) is None
+
+    @pytest.mark.parametrize("elapsed", ["12.5", None, True])
+    def test_tool_progress_with_non_numeric_elapsed_is_skipped(self, elapsed):
+        frame = {**TOOL_PROGRESS_FRAME, "elapsed_time_seconds": elapsed}
+        assert parse_message(frame) is None
+
+    def test_tool_progress_missing_elapsed_is_skipped(self):
+        frame = {
+            k: v for k, v in TOOL_PROGRESS_FRAME.items() if k != "elapsed_time_seconds"
+        }
+        assert parse_message(frame) is None
+
+
+class TestToolUseSummaryMessage:
+    """Top-level ``tool_use_summary`` frames parse into ToolUseSummaryMessage."""
+
+    def test_parse_tool_use_summary(self):
+        data = {
+            "type": "tool_use_summary",
+            "summary": "Read 3 files and ran the test suite",
+            "preceding_tool_use_ids": ["toolu_01", "toolu_02", "toolu_03"],
+            "uuid": "ts-uuid-1",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, ToolUseSummaryMessage)
+        assert message.summary == "Read 3 files and ran the test suite"
+        assert message.preceding_tool_use_ids == ["toolu_01", "toolu_02", "toolu_03"]
+        assert message.uuid == "ts-uuid-1"
+        assert message.session_id == "sess-1"
+        assert message.data == data
+
+    def test_tool_use_summary_without_preceding_ids_defaults_empty(self):
+        data = {"type": "tool_use_summary", "summary": "Edited one file"}
+        message = parse_message(data)
+        assert isinstance(message, ToolUseSummaryMessage)
+        assert message.preceding_tool_use_ids == []
+        assert message.uuid is None
+        assert message.session_id is None
+
+    def test_tool_use_summary_non_list_preceding_ids_defaults_empty(self):
+        data = {
+            "type": "tool_use_summary",
+            "summary": "Edited one file",
+            "preceding_tool_use_ids": "toolu_01",
+        }
+        message = parse_message(data)
+        assert isinstance(message, ToolUseSummaryMessage)
+        assert message.preceding_tool_use_ids == []
+        assert message.data["preceding_tool_use_ids"] == "toolu_01"
+
+    def test_tool_use_summary_without_summary_is_skipped(self):
+        data = {"type": "tool_use_summary", "preceding_tool_use_ids": ["toolu_01"]}
+        assert parse_message(data) is None
+
+    @pytest.mark.parametrize("summary", [None, 42, ["Edited one file"]])
+    def test_tool_use_summary_non_string_summary_is_skipped(self, summary):
+        data = {"type": "tool_use_summary", "summary": summary}
+        assert parse_message(data) is None
+
+
+class TestAuthStatusMessage:
+    """Top-level ``auth_status`` frames parse into AuthStatusMessage."""
+
+    def test_parse_auth_status_in_progress(self):
+        data = {
+            "type": "auth_status",
+            "isAuthenticating": True,
+            "output": ["Opening browser for login...", "Waiting for callback"],
+            "uuid": "as-uuid-1",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.is_authenticating is True
+        assert message.output == [
+            "Opening browser for login...",
+            "Waiting for callback",
+        ]
+        assert message.error is None
+        assert message.uuid == "as-uuid-1"
+        assert message.session_id == "sess-1"
+        assert message.data == data
+
+    def test_parse_auth_status_failed(self):
+        data = {
+            "type": "auth_status",
+            "isAuthenticating": False,
+            "output": [],
+            "error": "Login timed out",
+            "uuid": "as-uuid-2",
+            "session_id": "sess-1",
+        }
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.is_authenticating is False
+        assert message.output == []
+        assert message.error == "Login timed out"
+
+    def test_parse_auth_status_snake_case(self):
+        data = {"type": "auth_status", "is_authenticating": True, "output": []}
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.is_authenticating is True
+
+    def test_auth_status_missing_flag_defaults_false(self):
+        data = {"type": "auth_status", "uuid": "as-uuid-3", "session_id": "sess-1"}
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.is_authenticating is False
+        assert message.output == []
+        assert message.error is None
+        assert message.data == data
+
+    def test_auth_status_null_flag_defaults_false(self):
+        data = {"type": "auth_status", "isAuthenticating": None}
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.is_authenticating is False
+
+    def test_auth_status_non_list_output_defaults_empty(self):
+        data = {"type": "auth_status", "isAuthenticating": True, "output": "line"}
+        message = parse_message(data)
+        assert isinstance(message, AuthStatusMessage)
+        assert message.output == []
+        assert message.data["output"] == "line"
+
+
+class TestNewContentBlocks:
+    """redacted_thinking, optional thinking signatures, server tool results
+    of every kind, and UnknownBlock for anything the SDK does not model."""
+
+    def test_redacted_thinking_block(self):
+        data = _assistant_frame(
+            {"type": "redacted_thinking", "data": "EqQBCgIYAhIMopaque=="},
+            {"type": "text", "text": "Done."},
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 2
+        block = message.content[0]
+        assert isinstance(block, RedactedThinkingBlock)
+        assert block.data == "EqQBCgIYAhIMopaque=="
+        assert isinstance(message.content[1], TextBlock)
+
+    def test_thinking_without_signature_parses_with_empty_signature(self):
+        data = _assistant_frame({"type": "thinking", "thinking": "Summarized plan"})
+        try:
+            message = parse_message(data)
+        except MessageParseError as exc:
+            pytest.fail(f"thinking without signature must parse, got {exc!r}")
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "Summarized plan"
+        assert block.signature == ""
+
+    def test_thinking_with_null_signature_parses_with_empty_signature(self):
+        data = _assistant_frame(
+            {"type": "thinking", "thinking": "Summarized plan", "signature": None}
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.signature == ""
+
+    def test_unknown_block_image_in_user_content(self):
+        image = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo=",
+            },
+        }
+        data = _user_frame({"type": "text", "text": "What is in this picture?"}, image)
+        message = parse_message(data)
+        assert isinstance(message, UserMessage)
+        assert isinstance(message.content, list)
+        assert len(message.content) == 2
+        assert isinstance(message.content[0], TextBlock)
+        block = message.content[1]
+        assert isinstance(block, UnknownBlock)
+        assert block.type == "image"
+        assert block.data == image
+
+    def test_unknown_block_image_in_assistant_content(self):
+        image = {
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/chart.png"},
+        }
+        data = _assistant_frame(image, {"type": "text", "text": "Here is the chart"})
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 2
+        block = message.content[0]
+        assert isinstance(block, UnknownBlock)
+        assert block.type == "image"
+        assert block.data == image
+        assert isinstance(message.content[1], TextBlock)
+
+    @pytest.mark.parametrize("role", ["user", "assistant"])
+    def test_unknown_block_future_type_preserved(self, role):
+        future = {
+            "type": "holographic_projection",
+            "frames": 3,
+            "payload": {"depth": [1, 2, 3]},
+        }
+        data = _user_frame(future) if role == "user" else _assistant_frame(future)
+        message = parse_message(data)
+        assert isinstance(message, UserMessage | AssistantMessage)
+        assert isinstance(message.content, list)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, UnknownBlock)
+        assert block.type == "holographic_projection"
+        assert block.data == future
+        assert block.data["payload"]["depth"] == [1, 2, 3]
+
+    def test_unknown_blocks_keep_their_position_among_known_user_blocks(self):
+        """text / tool_use / tool_result in user content stay typed; the rest is UnknownBlock."""
+        data = _user_frame(
+            {"type": "text", "text": "Look at this"},
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            {"type": "tool_use", "id": "use_1", "name": "Read", "input": {"p": 1}},
+            {"type": "tool_result", "tool_use_id": "use_1", "content": "ok"},
+            {"type": "document", "title": "spec.pdf"},
+        )
+        message = parse_message(data)
+        assert isinstance(message, UserMessage)
+        assert isinstance(message.content, list)
+        assert [type(block) for block in message.content] == [
+            TextBlock,
+            UnknownBlock,
+            ToolUseBlock,
+            ToolResultBlock,
+            UnknownBlock,
+        ]
+        assert message.content[2].id == "use_1"
+        assert message.content[3].tool_use_id == "use_1"
+        assert message.content[4].type == "document"
+        assert message.content[4].data == {"type": "document", "title": "spec.pdf"}
+
+    @pytest.mark.parametrize("name", get_args(ServerToolName))
+    def test_every_server_tool_result_type_maps_to_server_tool_result_block(self, name):
+        block_type = f"{name}_tool_result"
+        data = _assistant_frame(
+            {
+                "type": block_type,
+                "tool_use_id": f"srvtoolu_{name}",
+                "content": {"type": f"{name}_result", "value": 1},
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.tool_use_id == f"srvtoolu_{name}"
+        assert block.content == {"type": f"{name}_result", "value": 1}
+
+    @pytest.mark.parametrize(
+        "block_type",
+        [
+            "advisor_tool_result",
+            "web_search_tool_result",
+            "web_fetch_tool_result",
+            "code_execution_tool_result",
+            "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result",
+            "tool_search_tool_result",
+        ],
+    )
+    def test_wire_server_tool_result_types(self, block_type):
+        """The block type names the API actually emits all map to ServerToolResultBlock."""
+        data = _assistant_frame(
+            {
+                "type": block_type,
+                "tool_use_id": "srvtoolu_wire",
+                "content": {"type": "result", "ok": True},
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.tool_use_id == "srvtoolu_wire"
+        assert block.content == {"type": "result", "ok": True}
+
+    def test_web_search_result_list_content(self):
+        results = [
+            {
+                "type": "web_search_result",
+                "title": "Anthropic",
+                "url": "https://www.anthropic.com",
+                "encrypted_content": "EpQBCg...",
+                "page_age": None,
+            },
+            {
+                "type": "web_search_result",
+                "title": "Claude",
+                "url": "https://claude.ai",
+                "encrypted_content": "EqMBCg...",
+                "page_age": "2 days ago",
+            },
+        ]
+        data = _assistant_frame(
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_ws",
+                "content": results,
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert isinstance(block.content, list)
+        assert block.content == results
+
+    def test_server_tool_result_error_object_content(self):
+        data = _assistant_frame(
+            {
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "srvtoolu_wf",
+                "content": {
+                    "type": "web_fetch_tool_result_error",
+                    "error_code": "url_not_accessible",
+                },
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.content == {
+            "type": "web_fetch_tool_result_error",
+            "error_code": "url_not_accessible",
+        }
+
+    def test_server_tool_result_without_content_keeps_remaining_fields(self):
+        data = _assistant_frame(
+            {
+                "type": "code_execution_tool_result",
+                "tool_use_id": "srvtoolu_ce",
+                "stdout": "42\n",
+                "stderr": "",
+                "return_code": 0,
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.tool_use_id == "srvtoolu_ce"
+        assert block.content == {"stdout": "42\n", "stderr": "", "return_code": 0}
+
+    def test_server_tool_result_string_content_is_kept(self):
+        """A non-object content value is folded into the remaining-fields dict."""
+        data = _assistant_frame(
+            {
+                "type": "bash_code_execution_tool_result",
+                "tool_use_id": "srvtoolu_bash",
+                "content": "exit 1",
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.content == {"content": "exit 1"}
+
+    def test_future_server_tool_result_type_maps_to_server_tool_result_block(self):
+        data = _assistant_frame(
+            {
+                "type": "memory_vault_tool_result",
+                "tool_use_id": "srvtoolu_future",
+                "content": {"type": "memory_vault_result", "hits": 2},
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ServerToolResultBlock)
+        assert block.tool_use_id == "srvtoolu_future"
+        assert block.content == {"type": "memory_vault_result", "hits": 2}
+
+    def test_server_tool_result_without_tool_use_id_is_unknown_block(self):
+        raw = {"type": "web_search_tool_result", "content": []}
+        message = parse_message(_assistant_frame(raw))
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, UnknownBlock)
+        assert block.type == "web_search_tool_result"
+        assert block.data == raw
+
+    def test_tool_result_in_assistant_content_stays_tool_result_block(self):
+        data = _assistant_frame(
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        assert len(message.content) == 1
+        block = message.content[0]
+        assert isinstance(block, ToolResultBlock)
+        assert not isinstance(block, ServerToolResultBlock)
+        assert block.tool_use_id == "t1"
+
+    def test_server_tool_use_block_still_parses(self):
+        data = _assistant_frame(
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_01",
+                "name": "web_search",
+                "input": {"query": "claude agent sdk"},
+            }
+        )
+        message = parse_message(data)
+        assert isinstance(message, AssistantMessage)
+        block = message.content[0]
+        assert isinstance(block, ServerToolUseBlock)
+        assert block.name == "web_search"
+
+
+SYSTEM_SUBCLASS_FRAMES: list[tuple[dict[str, Any], type[SystemMessage]]] = [
+    (dict(MINIMAL_INIT_FRAME), InitMessage),
+    (
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"trigger": "auto", "pre_tokens": 10},
+        },
+        CompactBoundaryMessage,
+    ),
+    ({"type": "system", "subtype": "status", "status": "compacting"}, StatusMessage),
+    (
+        {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "t1",
+            "description": "d",
+            "uuid": "u",
+            "session_id": "s",
+        },
+        TaskStartedMessage,
+    ),
+    (
+        {
+            "type": "system",
+            "subtype": "task_progress",
+            "task_id": "t1",
+            "description": "d",
+            "usage": {"total_tokens": 1, "tool_uses": 0, "duration_ms": 1},
+            "uuid": "u",
+            "session_id": "s",
+        },
+        TaskProgressMessage,
+    ),
+    (
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "t1",
+            "status": "completed",
+            "output_file": "/o",
+            "summary": "s",
+            "uuid": "u",
+            "session_id": "s",
+        },
+        TaskNotificationMessage,
+    ),
+    (
+        {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": "t1",
+            "patch": {"status": "completed"},
+        },
+        TaskUpdatedMessage,
+    ),
+    (
+        {"type": "system", "subtype": "hook_started", "hook_event": "PreToolUse"},
+        HookEventMessage,
+    ),
+    (
+        {"type": "system", "subtype": "hook_response", "hook_event": "PostToolUse"},
+        HookEventMessage,
+    ),
+    (
+        {
+            "type": "system",
+            "subtype": "mirror_error",
+            "key": {"project_key": "p", "session_id": "s"},
+            "error": "boom",
+        },
+        MirrorErrorMessage,
+    ),
+]
+
+
+class TestParserInvariants:
+    """Behaviour pinned by existing callers that the richer model must keep."""
+
+    def test_unknown_system_subtype_is_exactly_system_message(self):
+        data = {"type": "system", "subtype": "some_future_subtype", "session_id": "s"}
+        message = parse_message(data)
+        assert type(message) is SystemMessage
+        assert not isinstance(message, InitMessage)
+        assert not isinstance(message, CompactBoundaryMessage)
+        assert not isinstance(message, StatusMessage)
+        assert message.subtype == "some_future_subtype"
+        assert message.data == data
+
+    def test_system_frame_without_subtype_still_raises(self):
+        with pytest.raises(MessageParseError) as exc_info:
+            parse_message({"type": "system"})
+        assert "Missing required field in system message" in str(exc_info.value)
+
+    def test_unknown_top_level_type_still_returns_none(self):
+        assert parse_message({"type": "telemetry_blob", "uuid": "u"}) is None
+
+    @pytest.mark.parametrize(
+        ("frame", "expected"),
+        SYSTEM_SUBCLASS_FRAMES,
+        ids=[frame["subtype"] for frame, _ in SYSTEM_SUBCLASS_FRAMES],
+    )
+    def test_every_system_subclass_is_a_system_message_with_raw_data(
+        self, frame, expected
+    ):
+        message = parse_message(dict(frame))
+        assert isinstance(message, expected)
+        assert isinstance(message, SystemMessage)
+        assert message.subtype == frame["subtype"]
+        assert message.data == frame
+
+    @pytest.mark.parametrize(
+        ("frame", "prefix"),
+        [
+            ({"type": "user"}, "Missing required field in user message"),
+            (
+                {"type": "user", "message": {"content": [{"type": "text"}]}},
+                "Missing required field in user message",
+            ),
+            (
+                {"type": "user", "message": {"content": [{"text": "no type"}]}},
+                "Missing required field in user message",
+            ),
+            ({"type": "assistant"}, "Missing required field in assistant message"),
+            (
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "x"}]},
+                },
+                "Missing required field in assistant message",
+            ),
+            (
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "redacted_thinking"}],
+                        "model": "m",
+                    },
+                },
+                "Missing required field in assistant message",
+            ),
+            (
+                {"type": "result", "subtype": "success"},
+                "Missing required field in result message",
+            ),
+        ],
+    )
+    def test_missing_field_frames_still_raise_with_role_prefix(self, frame, prefix):
+        with pytest.raises(MessageParseError) as exc_info:
+            parse_message(frame)
+        assert prefix in str(exc_info.value)
+        assert exc_info.value.data == frame
+
+    def test_hook_events_still_route_before_generic_system_handling(self):
+        data = {
+            "type": "system",
+            "subtype": "hook_started",
+            "hook_event": "PreToolUse",
+            "session_id": "s",
+        }
+        message = parse_message(data)
+        assert isinstance(message, HookEventMessage)
+        assert message.hook_event_name == "PreToolUse"

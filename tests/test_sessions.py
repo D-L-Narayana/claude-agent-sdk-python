@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -10,14 +11,20 @@ from pathlib import Path
 import pytest
 
 from claude_agent_sdk import (
+    AssistantMessage,
     SDKSessionInfo,
     SessionMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
     get_session_info,
     get_session_messages,
     get_subagent_messages,
     list_sessions,
     list_subagents,
 )
+from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk._internal.sessions import (
     _build_conversation_chain,
     _extract_first_prompt_from_head,
@@ -28,6 +35,7 @@ from claude_agent_sdk._internal.sessions import (
     _sanitize_path,
     _simple_hash,
     _validate_uuid,
+    to_sdk_message,
 )
 
 # Matches the CLI's on-disk JSONL format (JSON.stringify / json.dumps with
@@ -1993,3 +2001,218 @@ class TestGetSubagentMessages:
         (subagents_dir / "agent-empty.jsonl").write_text("")
 
         assert get_subagent_messages(sid, "empty", directory=project_path) == []
+
+
+# ---------------------------------------------------------------------------
+# to_sdk_message() tests
+# ---------------------------------------------------------------------------
+
+
+class TestToSdkMessage:
+    """Tests for to_sdk_message() — SessionMessage → typed SDK message."""
+
+    def test_user_string_content(self):
+        msg = SessionMessage(
+            type="user",
+            uuid="u1",
+            session_id="sess",
+            message={"role": "user", "content": "hello"},
+            parent_tool_use_id="toolu_parent",
+        )
+        out = to_sdk_message(msg)
+        assert isinstance(out, UserMessage)
+        assert out.content == "hello"
+        assert out.uuid == "u1"
+        assert out.parent_tool_use_id == "toolu_parent"
+        assert out.tool_use_result is None
+
+    def test_user_tool_result_blocks(self):
+        msg = SessionMessage(
+            type="user",
+            uuid="u2",
+            session_id="sess",
+            message={
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "ok",
+                        "is_error": False,
+                    },
+                    {"type": "text", "text": "and more"},
+                ],
+            },
+        )
+        out = to_sdk_message(msg)
+        assert isinstance(out, UserMessage)
+        assert out.content == [
+            ToolResultBlock(tool_use_id="toolu_1", content="ok", is_error=False),
+            TextBlock(text="and more"),
+        ]
+        assert out.uuid == "u2"
+        assert out.parent_tool_use_id is None
+
+    def test_assistant_text_and_tool_use_blocks(self):
+        msg = SessionMessage(
+            type="assistant",
+            uuid="a1",
+            session_id="sess",
+            message={
+                "role": "assistant",
+                "model": "test-model",
+                "id": "msg_01",
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+                "content": [
+                    {"type": "text", "text": "Let me look."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/x"},
+                    },
+                ],
+            },
+        )
+        out = to_sdk_message(msg)
+        assert isinstance(out, AssistantMessage)
+        assert out.model == "test-model"
+        assert out.content == [
+            TextBlock(text="Let me look."),
+            ToolUseBlock(id="toolu_1", name="Read", input={"file_path": "/tmp/x"}),
+        ]
+        assert out.uuid == "a1"
+        assert out.session_id == "sess"
+        assert out.message_id == "msg_01"
+        assert out.stop_reason == "tool_use"
+        assert out.usage == {"input_tokens": 1, "output_tokens": 2}
+        assert out.parent_tool_use_id is None
+
+    def test_subagent_parent_ids_carried(self):
+        """Messages from get_subagent_messages() carry the spawning tool_use id."""
+        msg = SessionMessage(
+            type="assistant",
+            uuid="a2",
+            session_id="sess",
+            message={
+                "role": "assistant",
+                "model": "test-model",
+                "content": [{"type": "text", "text": "sub"}],
+            },
+            parent_tool_use_id="toolu_agent",
+            parent_agent_id="agent-parent",
+        )
+        out = to_sdk_message(msg)
+        assert isinstance(out, AssistantMessage)
+        assert out.parent_tool_use_id == "toolu_agent"
+
+    def test_message_none_returns_none(self):
+        msg = SessionMessage(type="user", uuid="u", session_id="sess", message=None)
+        assert to_sdk_message(msg) is None
+
+    def test_unparseable_payload_returns_none_and_logs_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        caplog.set_level(logging.DEBUG, logger="claude_agent_sdk")
+        # Assistant content must be a list of blocks; a bare string is a
+        # MessageParseError in the live parser — surfaced here as None.
+        msg = SessionMessage(
+            type="assistant",
+            uuid="a-unparseable",
+            session_id="sess",
+            message={"role": "assistant", "content": "plain"},
+        )
+        assert to_sdk_message(msg) is None
+        # A payload missing the required ``content`` field.
+        msg2 = SessionMessage(
+            type="user",
+            uuid="u-unparseable",
+            session_id="sess",
+            message={"role": "user"},
+        )
+        assert to_sdk_message(msg2) is None
+        # A payload that is not an object at all.
+        msg3 = SessionMessage(
+            type="user", uuid="u-string", session_id="sess", message="not a dict"
+        )
+        assert to_sdk_message(msg3) is None
+
+        debug = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        for uid in ("a-unparseable", "u-unparseable", "u-string"):
+            assert any(uid in r.getMessage() for r in debug), uid
+        assert all(r.levelno < logging.WARNING for r in caplog.records)
+
+    def test_identity_with_parse_message_for_transcript(
+        self, claude_config_dir: Path, tmp_path: Path
+    ):
+        """Typed reads of a transcript equal live parsing of the same frames."""
+        project_path = str(tmp_path / "proj")
+        Path(project_path).mkdir(parents=True)
+        project_dir = _make_project_dir(
+            claude_config_dir, os.path.realpath(project_path)
+        )
+        sid = str(uuid.uuid4())
+        u1, a1, u2, a2 = (str(uuid.uuid4()) for _ in range(4))
+        entries = [
+            _make_transcript_entry("user", u1, None, sid, content="read /tmp/x"),
+            _make_transcript_entry(
+                "assistant",
+                a1,
+                u1,
+                sid,
+                content=[
+                    {"type": "text", "text": "ok"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/x"},
+                    },
+                ],
+            ),
+            _make_transcript_entry(
+                "user",
+                u2,
+                a1,
+                sid,
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "file body",
+                    }
+                ],
+            ),
+            _make_transcript_entry(
+                "assistant", a2, u2, sid, content=[{"type": "text", "text": "done"}]
+            ),
+        ]
+        for e in entries:
+            if e["type"] == "assistant":
+                e["message"]["model"] = "test-model"
+        _write_transcript(project_dir, sid, entries)
+
+        stored = get_session_messages(sid, directory=project_path)
+        assert [m.uuid for m in stored] == [u1, a1, u2, a2]
+
+        typed = [to_sdk_message(m) for m in stored]
+        expected = [
+            parse_message(
+                {
+                    "type": e["type"],
+                    "uuid": e["uuid"],
+                    "session_id": sid,
+                    "message": e["message"],
+                    "parent_tool_use_id": None,
+                }
+            )
+            for e in entries
+        ]
+        assert typed == expected
+        assert [type(t) for t in typed] == [
+            UserMessage,
+            AssistantMessage,
+            UserMessage,
+            AssistantMessage,
+        ]

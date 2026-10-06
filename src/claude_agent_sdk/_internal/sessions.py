@@ -20,7 +20,16 @@ from typing import Any
 
 import anyio
 
-from ..types import SDKSessionInfo, SessionKey, SessionMessage, SessionStore
+from .._errors import MessageParseError
+from ..types import (
+    AssistantMessage,
+    SDKSessionInfo,
+    SessionKey,
+    SessionMessage,
+    SessionStore,
+    UserMessage,
+)
+from .message_parser import parse_message
 from .session_store_validation import _store_implements
 
 logger = logging.getLogger(__name__)
@@ -1056,6 +1065,92 @@ def _to_session_message(
     )
 
 
+def to_sdk_message(
+    message: SessionMessage,
+) -> UserMessage | AssistantMessage | None:
+    """Convert a stored :class:`SessionMessage` into a typed SDK message.
+
+    ``get_session_messages()`` and its siblings return the raw Anthropic API
+    message dict in :attr:`SessionMessage.message`. This helper rebuilds the
+    wire frame the CLI would have streamed for that turn (``type``, ``uuid``,
+    ``session_id``, ``message``, ``parent_tool_use_id``) and runs it through
+    the same parser a live ``query()`` / ``ClaudeSDKClient`` stream uses, so
+    one rendering code path can serve historical and live conversations:
+
+    - a ``"user"`` message becomes a :class:`UserMessage` — ``content`` is the
+      prompt string, or a list of :class:`TextBlock` / :class:`ToolUseBlock` /
+      :class:`ToolResultBlock`;
+    - an ``"assistant"`` message becomes an :class:`AssistantMessage` with its
+      typed content blocks, ``model``, ``usage``, ``message_id``,
+      ``stop_reason``, ``session_id`` and ``uuid``.
+
+    ``parent_tool_use_id`` is carried over (set for subagent messages from
+    ``get_subagent_messages()``); ``parent_agent_id`` has no counterpart on
+    the live message types and is not represented. Stream-only fields that
+    the transcript does not record (``UserMessage.tool_use_result``,
+    ``UserMessage.origin``, ``AssistantMessage.error``) are ``None``.
+
+    Args:
+        message: A message returned by ``get_session_messages()``,
+            ``get_subagent_messages()`` or their ``*_from_store`` variants.
+
+    Returns:
+        The typed message, or ``None`` when the stored payload cannot be
+        parsed — ``message.message`` is not a JSON object (e.g. ``None``), or
+        the parser rejects it (:class:`MessageParseError`, for example an
+        assistant payload without a ``content`` list or a ``model``). Such
+        messages are reported at ``DEBUG`` level and never raise, so a single
+        malformed transcript line does not abort rendering a session.
+
+    Example:
+        Render a session with the same code used for live messages::
+
+            for stored in get_session_messages(session_id, directory=cwd):
+                msg = to_sdk_message(stored)
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            print(block.text)
+    """
+    if not isinstance(message.message, dict):
+        logger.debug(
+            "to_sdk_message: %s message %s has no message object "
+            "(got %s); returning None",
+            message.type,
+            message.uuid,
+            type(message.message).__name__,
+        )
+        return None
+    frame: dict[str, Any] = {
+        "type": message.type,
+        "uuid": message.uuid,
+        "session_id": message.session_id,
+        "message": message.message,
+        "parent_tool_use_id": message.parent_tool_use_id,
+    }
+    try:
+        parsed = parse_message(frame)
+    except MessageParseError as e:
+        logger.debug(
+            "to_sdk_message: skipping unparseable %s message %s: %s",
+            message.type,
+            message.uuid,
+            e,
+        )
+        return None
+    if isinstance(parsed, (UserMessage, AssistantMessage)):
+        return parsed
+    # Only reachable if ``message.type`` is not "user"/"assistant" at runtime.
+    logger.debug(
+        "to_sdk_message: %s message %s did not parse to a user/assistant "
+        "message (got %s); returning None",
+        message.type,
+        message.uuid,
+        type(parsed).__name__,
+    )
+    return None
+
+
 def get_session_messages(
     session_id: str,
     directory: str | None = None,
@@ -1523,20 +1618,29 @@ def project_key_for_directory(directory: str | Path | None = None) -> str:
     return _sanitize_path(abs_path)
 
 
-def _entries_to_jsonl(entries: list[Any]) -> str:
-    """Serialize store entries to a JSONL string (one ``json.dumps`` per line).
+def _type_first(entry: Any) -> Any:
+    """Return a shallow copy of ``entry`` with its ``type`` key first.
+
+    Non-dict entries and dicts without ``type`` are returned unchanged.
 
     The ``SessionStore.load`` contract permits adapters to reorder object keys
     (e.g. Postgres JSONB), but ``_parse_session_info_from_lite`` scans for
-    ``{"type":"tag"`` as a line prefix. Hoist ``type`` to the front so the
-    store path matches the byte shape the disk path produces.
+    ``{"type":"tag"`` as a line prefix. Hoisting ``type`` makes store-sourced
+    lines match the byte shape the CLI writes — used when serializing store
+    entries for the lite-parse (:func:`_entries_to_jsonl`) and when exporting
+    them to disk (``export_session_from_store``).
     """
+    if isinstance(entry, dict) and "type" in entry:
+        return {"type": entry["type"], **entry}
+    return entry
 
-    def _type_first(e: Any) -> Any:
-        if isinstance(e, dict) and "type" in e:
-            return {"type": e["type"], **e}
-        return e
 
+def _entries_to_jsonl(entries: list[Any]) -> str:
+    """Serialize store entries to a JSONL string (one ``json.dumps`` per line).
+
+    ``type`` is hoisted to the front of each object (see :func:`_type_first`)
+    so the store path matches the byte shape the disk path produces.
+    """
     return (
         "\n".join(json.dumps(_type_first(e), separators=(",", ":")) for e in entries)
         + "\n"

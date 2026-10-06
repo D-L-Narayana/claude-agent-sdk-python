@@ -10,7 +10,10 @@
 #   ANTHROPIC_API_KEY=sk-... ./scripts/test-docker.sh e2e   # Run e2e tests
 #   ANTHROPIC_API_KEY=sk-... ./scripts/test-docker.sh all   # Run all tests
 
-set -e
+# -e: stop at the first failing command. -u: an unset variable is an error,
+# not a silent empty string. -o pipefail: a pipeline fails if any element
+# fails, not only the last one.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -42,7 +45,7 @@ case "${1:-unit}" in
             python -m pytest tests/ -v
         ;;
     e2e)
-        if [ -z "$ANTHROPIC_API_KEY" ]; then
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
             echo "Error: ANTHROPIC_API_KEY environment variable is required for e2e tests"
             echo ""
             echo "Usage: ANTHROPIC_API_KEY=sk-... $0 e2e"
@@ -60,7 +63,7 @@ case "${1:-unit}" in
             python -m pytest tests/ -v
 
         echo ""
-        if [ -n "$ANTHROPIC_API_KEY" ]; then
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
             echo "Running e2e tests in Docker..."
             docker run --rm -e ANTHROPIC_API_KEY \
                 claude-sdk-test python -m pytest e2e-tests/ -v -m e2e

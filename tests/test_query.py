@@ -25,7 +25,15 @@ from claude_agent_sdk import (
     query,
     tool,
 )
-from claude_agent_sdk._errors import CLIConnectionError, ProcessError, ResultError
+from claude_agent_sdk._errors import (
+    ClaudeSDKError,
+    CLIConnectionError,
+    ControlRequestError,
+    ControlRequestTimeoutError,
+    ProcessError,
+    ResultError,
+)
+from claude_agent_sdk._internal.abort_signal import AbortSignal
 from claude_agent_sdk._internal.query import Query, run_end_ceiling_ms
 from claude_agent_sdk.types import HookMatcher
 
@@ -2164,6 +2172,390 @@ class TestControlCancelRequest:
         await q.close()
 
         assert "fast_1" not in q._inflight_requests
+
+    @pytest.mark.anyio
+    async def test_cancel_request_aborts_signal_with_reason(self):
+        """A control_cancel_request aborts the request's AbortSignal with the
+        reason "cancelled by Claude Code" *before* cancelling the handler, so a
+        callback awaiting ``signal.wait()`` observes the reason — and the
+        abandoned request still gets no response."""
+        hook_started = anyio.Event()
+        hook_observed = anyio.Event()
+        observed: list[tuple[bool, str | None]] = []
+        signals: list[Any] = []
+
+        async def waiting_hook(input_data, tool_use_id, context):
+            signal = context["signal"]
+            signals.append(signal)
+            hook_started.set()
+            try:
+                await signal.wait()
+            finally:
+                # Reached whether wait() returned normally (trio delivers the
+                # cancellation at the next checkpoint) or raised the
+                # cancellation (asyncio throws it into the pending wait).
+                hook_observed.set()
+                observed.append((signal.aborted, signal.reason))
+            return {}
+
+        mock_transport = AsyncMock()
+        emitted: list[dict] = []
+
+        async def mock_receive():
+            yield {
+                "type": "control_request",
+                "request_id": "hook_1",
+                "request": {
+                    "subtype": "hook_callback",
+                    "callback_id": "hook_0",
+                },
+            }
+            await hook_started.wait()
+            yield {
+                "type": "control_cancel_request",
+                "request_id": "hook_1",
+            }
+            await hook_observed.wait()
+
+        async def mock_write(data):
+            emitted.append(json.loads(data))
+
+        mock_transport.read_messages = mock_receive
+        mock_transport.write = mock_write
+        mock_transport.close = AsyncMock()
+        mock_transport.is_ready = Mock(return_value=True)
+
+        q = Query(transport=mock_transport, is_streaming_mode=True)
+        q.hook_callbacks["hook_0"] = waiting_hook
+
+        await q.start()
+        with anyio.fail_after(5):
+            await hook_observed.wait()
+            # The handler's cleanup runs once the cancellation is delivered.
+            await _until(lambda: "hook_1" not in q._inflight_signals)
+        await q.close()
+
+        assert isinstance(signals[0], AbortSignal)
+        assert observed == [(True, "cancelled by Claude Code")]
+        assert "hook_1" not in q._inflight_requests
+        assert "hook_1" not in q._inflight_signals
+        responses = [m for m in emitted if m.get("type") == "control_response"]
+        assert responses == [], (
+            f"Cancelled request should not write a response, got: {responses}"
+        )
+
+    @pytest.mark.anyio
+    async def test_close_aborts_inflight_signals(self):
+        """close() aborts every in-flight request's signal with the reason
+        "query closed" before cancelling the handler tasks."""
+        hook_started = anyio.Event()
+        hook_done = anyio.Event()
+        observed: list[tuple[bool, str | None]] = []
+
+        async def waiting_hook(input_data, tool_use_id, context):
+            signal = context["signal"]
+            hook_started.set()
+            try:
+                await signal.wait()
+            finally:
+                hook_done.set()
+                observed.append((signal.aborted, signal.reason))
+            return {}
+
+        mock_transport = AsyncMock()
+        emitted: list[dict] = []
+
+        async def mock_receive():
+            yield {
+                "type": "control_request",
+                "request_id": "hook_1",
+                "request": {
+                    "subtype": "hook_callback",
+                    "callback_id": "hook_0",
+                },
+            }
+            # Stay open until close() cancels the reader.
+            await anyio.Event().wait()
+
+        async def mock_write(data):
+            emitted.append(json.loads(data))
+
+        mock_transport.read_messages = mock_receive
+        mock_transport.write = mock_write
+        mock_transport.close = AsyncMock()
+        mock_transport.is_ready = Mock(return_value=True)
+
+        q = Query(transport=mock_transport, is_streaming_mode=True)
+        q.hook_callbacks["hook_0"] = waiting_hook
+
+        await q.start()
+        with anyio.fail_after(5):
+            await hook_started.wait()
+        assert "hook_1" in q._inflight_signals
+        signal = q._inflight_signals["hook_1"]
+        assert isinstance(signal, AbortSignal)
+        assert signal.aborted is False
+
+        await q.close()
+        with anyio.fail_after(5):
+            await hook_done.wait()
+            await _until(lambda: not q._inflight_signals)
+
+        assert observed == [(True, "query closed")]
+        assert signal.reason == "query closed"
+        responses = [m for m in emitted if m.get("type") == "control_response"]
+        assert responses == [], (
+            f"Request abandoned by close() should not write a response: {responses}"
+        )
+
+    @pytest.mark.anyio
+    async def test_completed_request_is_removed_from_inflight_signals(self):
+        """A handler that completes removes its signal, so a later cancel or
+        close() cannot abort a request that was already answered."""
+        seen: list[Any] = []
+
+        async def fast_hook(input_data, tool_use_id, context):
+            seen.append(context["signal"])
+            return {}
+
+        mock_transport = _make_mock_transport(
+            messages=_ASSISTANT_AND_RESULT,
+            control_requests=[
+                {
+                    "type": "control_request",
+                    "request_id": "fast_1",
+                    "request": {
+                        "subtype": "hook_callback",
+                        "callback_id": "hook_0",
+                    },
+                }
+            ],
+        )
+        q = Query(transport=mock_transport, is_streaming_mode=True)
+        q.hook_callbacks["hook_0"] = fast_hook
+
+        await q.start()
+        async for msg in q.receive_messages():
+            if msg.get("type") == "result":
+                break
+        with anyio.fail_after(5):
+            await _until(lambda: "fast_1" not in q._inflight_signals)
+        await q.close()
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], AbortSignal)
+        assert "fast_1" not in q._inflight_signals
+        # Answered before close(): never aborted.
+        assert seen[0].aborted is False
+        assert seen[0].reason is None
+
+
+class TestTypedControlRequestErrors:
+    """Control-protocol failures surface as typed ClaudeSDKError subclasses
+    instead of bare ``Exception``."""
+
+    @pytest.mark.anyio
+    async def test_timeout_raises_control_request_timeout_error(self):
+        transport = _make_mock_transport(messages=[])
+        q = Query(transport=transport, is_streaming_mode=True)
+
+        with pytest.raises(
+            ControlRequestTimeoutError, match=r"^Control request timeout: set_model$"
+        ) as exc_info:
+            await q._send_control_request(
+                {"subtype": "set_model", "model": "x"}, timeout=0.01
+            )
+        await q.close()
+        q.close_receive_stream()
+
+        err = exc_info.value
+        assert isinstance(err, ControlRequestError)
+        assert isinstance(err, ClaudeSDKError)
+        assert err.timeout == 0.01
+        assert err.subtype == "set_model"
+        assert isinstance(err.__cause__, TimeoutError)
+        # The id matches the request that was written to the CLI.
+        written = json.loads(transport.write.call_args[0][0])
+        assert written["type"] == "control_request"
+        assert err.request_id == written["request_id"]
+        # Nothing is left pending for the request that timed out.
+        assert q.pending_control_responses == {}
+        assert q.pending_control_results == {}
+
+    @pytest.mark.anyio
+    async def test_non_streaming_mode_raises_control_request_error(self):
+        transport = _make_mock_transport(messages=[])
+        q = Query(transport=transport, is_streaming_mode=False)
+
+        with pytest.raises(
+            ControlRequestError, match="Control requests require streaming mode"
+        ) as exc_info:
+            await q.interrupt()
+        q.close_receive_stream()
+
+        assert type(exc_info.value) is ControlRequestError
+        assert exc_info.value.subtype == "interrupt"
+        assert exc_info.value.request_id is None
+        transport.write.assert_not_called()
+
+    @staticmethod
+    def _cli_that_fails_control_requests(error_payload: dict[str, Any]) -> AsyncMock:
+        """Mock transport whose CLI answers every control request with an
+        error response built from ``error_payload``."""
+        mock_transport = AsyncMock()
+        requests: list[dict[str, Any]] = []
+        got_request = anyio.Event()
+
+        async def mock_write(data):
+            frame = json.loads(data)
+            if frame.get("type") == "control_request":
+                requests.append(frame)
+                got_request.set()
+
+        async def mock_receive():
+            await got_request.wait()
+            yield {
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": requests[0]["request_id"],
+                    **error_payload,
+                },
+            }
+            await anyio.Event().wait()  # stay open until close()
+
+        mock_transport.read_messages = mock_receive
+        mock_transport.write = mock_write
+        mock_transport.close = AsyncMock()
+        mock_transport.end_input = AsyncMock()
+        mock_transport.is_ready = Mock(return_value=True)
+        mock_transport.requests = requests
+        return mock_transport
+
+    @pytest.mark.anyio
+    async def test_cli_error_response_raises_control_request_error(self):
+        """A ``control_response`` with ``subtype: "error"`` surfaces as a
+        ControlRequestError carrying the CLI's text, the *original* request's
+        subtype and its request_id."""
+        transport = self._cli_that_fails_control_requests(
+            {"error": "Model 'nope' is not available"}
+        )
+        q = Query(transport=transport, is_streaming_mode=True)
+        await q.start()
+
+        with (
+            anyio.fail_after(5),
+            pytest.raises(ControlRequestError) as exc_info,
+        ):
+            await q.set_model("nope")
+        await q.close()
+        q.close_receive_stream()
+
+        err = exc_info.value
+        assert type(err) is ControlRequestError
+        assert str(err) == "Model 'nope' is not available"
+        assert err.subtype == "set_model"
+        assert err.request_id == transport.requests[0]["request_id"]
+        assert q.pending_control_responses == {}
+        assert q.pending_control_results == {}
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("error_payload", [{}, {"error": None}, {"error": ""}])
+    async def test_cli_error_response_without_text_defaults_to_unknown_error(
+        self, error_payload
+    ):
+        transport = self._cli_that_fails_control_requests(error_payload)
+        q = Query(transport=transport, is_streaming_mode=True)
+        await q.start()
+
+        with (
+            anyio.fail_after(5),
+            pytest.raises(ControlRequestError, match=r"^Unknown error$") as exc_info,
+        ):
+            await q.get_mcp_status()
+        await q.close()
+        q.close_receive_stream()
+
+        assert exc_info.value.subtype == "mcp_status"
+        assert exc_info.value.request_id == transport.requests[0]["request_id"]
+
+    @pytest.mark.anyio
+    async def test_error_response_to_cli_includes_exception_type(self):
+        """The error text written back to the CLI names the exception type,
+        so a hook/permission failure reads as a Python error, not prose."""
+
+        async def failing(tool_name, input_data, context):
+            raise ValueError("Callback error")
+
+        transport = _make_mock_transport(messages=[])
+        q = Query(transport=transport, is_streaming_mode=True, can_use_tool=failing)
+
+        await q._handle_control_request(
+            {
+                "type": "control_request",
+                "request_id": "perm_1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "ls"},
+                    "permission_suggestions": [],
+                },
+            }
+        )
+        q.close_receive_stream()
+
+        frame = json.loads(transport.write.call_args[0][0])
+        assert frame["response"] == {
+            "subtype": "error",
+            "request_id": "perm_1",
+            "error": "ValueError: Callback error",
+        }
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("request_body", "expected_error"),
+        [
+            (
+                {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {},
+                    "permission_suggestions": [],
+                },
+                "ControlRequestError: canUseTool callback is not provided",
+            ),
+            (
+                {"subtype": "hook_callback", "callback_id": "missing"},
+                "ControlRequestError: No hook callback found for ID: missing",
+            ),
+            (
+                {"subtype": "mcp_message", "server_name": "", "message": {}},
+                "ControlRequestError: Missing server_name or message for MCP request",
+            ),
+            (
+                {"subtype": "bogus"},
+                "ControlRequestError: Unsupported control request subtype: bogus",
+            ),
+        ],
+    )
+    async def test_protocol_errors_are_control_request_errors(
+        self, request_body, expected_error
+    ):
+        """The SDK-side refusals keep their message text but are typed."""
+        transport = _make_mock_transport(messages=[])
+        q = Query(transport=transport, is_streaming_mode=True)
+
+        await q._handle_control_request(
+            {"type": "control_request", "request_id": "r_1", "request": request_body}
+        )
+        q.close_receive_stream()
+
+        frame = json.loads(transport.write.call_args[0][0])
+        assert frame["response"] == {
+            "subtype": "error",
+            "request_id": "r_1",
+            "error": expected_error,
+        }
 
 
 class TestProcessExitAfterErrorResult:

@@ -53,7 +53,7 @@ Use this when you need to release with a specific version number (e.g., for mino
 **Flow:**
 
 1. Go to [**Actions → Publish to PyPI**](https://github.com/anthropics/claude-agent-sdk-python/actions/workflows/publish.yml) and click **Run workflow**.
-2. Enter the desired version (e.g., `0.2.0`).
+2. Enter the desired version (e.g., `0.2.0` — no leading `v`; the git tag gets the `v`).
 3. The workflow runs the full test suite (Python 3.10–3.13) and lint checks.
 4. On success, it calls `build-and-publish.yml`, which builds, publishes, pushes, tags, and creates a GitHub Release.
 
@@ -63,15 +63,33 @@ All release-related scripts live in `scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `update_version.py` | Updates SDK version in `pyproject.toml` and `_version.py` |
+| `update_version.py` | Updates SDK version in `pyproject.toml` and `_version.py`; rejects anything that is not `MAJOR.MINOR.PATCH` with an optional PEP 440 `aN`/`bN`/`rcN`, `.postN` or `.devN` segment (no leading `v`), and leaves both files untouched on any error |
 | `update_cli_version.py` | Updates CLI version in `_cli_version.py` |
 | `build_wheel.py` | Downloads the CLI binary, builds the wheel, retags with platform-specific tags |
 | `download_cli.py` | Downloads the Claude Code CLI binary for the current platform |
 
-## Required Secrets
+## Required Secrets and Variables
 
 | Secret | Used For |
 |---|---|
 | `PYPI_API_TOKEN` | Publishing to PyPI |
-| `ANTHROPIC_API_KEY` | Changelog generation and e2e tests |
 | `DEPLOY_KEY` | SSH key for direct pushes to `main` |
+
+Claude API access for changelog generation (`build-and-publish.yml`) and the e2e jobs
+(`test.yml`) does not use a static API key. The workflows exchange the job's GitHub OIDC
+token (`id-token: write`) for a short-lived Claude API token via workload identity
+federation, configured through the repository variables `ANTHROPIC_FEDERATION_RULE_ID`,
+`ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID` and
+`ANTHROPIC_WORKSPACE_ID` (see `.github/actions/setup-claude-auth`).
+
+The `Test` workflow's real-API jobs (`test-e2e`, `test-e2e-docker`, `test-examples`) run
+only for pushes and same-repository pull requests **and** only when
+`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and
+`ANTHROPIC_SERVICE_ACCOUNT_ID` are configured for the repository. Where they are not (a
+fork, for example) those jobs are skipped rather than failed, so a green `Test` run there
+means the offline unit, lint and compatibility jobs passed — it is not evidence that the
+end-to-end tests or the example scripts ran against the API. Before publishing, confirm the
+run you are releasing from executed those jobs (they appear as completed, not skipped). The
+gate logic itself is checked by `tests/test_workflow_gates.py`, which parses the workflow
+with PyYAML (part of the `dev` extra) and evaluates each job's `if` expression under push,
+same-repository PR, external PR and missing-configuration scenarios.

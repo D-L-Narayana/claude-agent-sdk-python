@@ -14,15 +14,8 @@ messages will include StreamEvent messages interspersed with regular messages.
 """
 
 import asyncio
-from claude_agent_sdk import ClaudeSDKClient
-from claude_agent_sdk.types import (
-    ClaudeAgentOptions,
-    StreamEvent,
-    AssistantMessage,
-    UserMessage,
-    SystemMessage,
-    ResultMessage,
-)
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 
 async def main():

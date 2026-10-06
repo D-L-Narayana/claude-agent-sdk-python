@@ -38,12 +38,24 @@ import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
+import pytest
 
 from claude_agent_sdk._internal.message_parser import parse_message
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+from claude_agent_sdk._internal.transport.subprocess_cli import (
+    SubprocessCLITransport,
+    clear_cli_version_cache,
+)
 from claude_agent_sdk.types import ClaudeAgentOptions, ToolResultBlock, UserMessage
 
 DEFAULT_CLI_PATH = "/usr/bin/claude"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_version_cache() -> None:
+    """The `claude -v` probe result is cached per binary for the life of the
+    process; start every test from an empty cache."""
+    clear_cli_version_cache()
+
 
 # Layer-2 threshold as confirmed in claude-cli-internal toolLimits.ts
 _LAYER2_THRESHOLD_CHARS = 50_000

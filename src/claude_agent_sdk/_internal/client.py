@@ -1,23 +1,17 @@
 """Internal client implementation."""
 
 import json
-import os
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
-from dataclasses import asdict
 from typing import Any
 
-from ..types import (
-    ClaudeAgentOptions,
-    Message,
-    _configure_can_use_tool,
-    _hooks_to_internal_format,
-)
+from ..types import ClaudeAgentOptions, Message, _configure_can_use_tool
 from .message_parser import parse_message
-from .query import Query, run_end_ceiling_ms, stamp_user_message
+from .options_validation import validate_options
+from .query import Query, stamp_user_message
+from .query_setup import attach_session_store, query_kwargs_for
 from .session_resume import (
     MaterializedResume,
     apply_materialized_options,
-    build_mirror_batcher,
     materialize_resume_session,
 )
 from .session_store_validation import validate_session_store_options
@@ -37,10 +31,17 @@ class InternalClient:
         options: ClaudeAgentOptions,
         transport: Transport | None = None,
     ) -> AsyncIterator[Message]:
-        """Process a query through transport and Query."""
+        """Process a query through transport and Query.
 
-        # Fail fast on invalid session_store option combinations before
-        # spawning the subprocess.
+        Raises:
+            ValueError: If ``options`` combine settings the SDK cannot honor
+                (see ``validate_options``). Raised before the subprocess is
+                spawned and before any session store is read.
+        """
+
+        # Fail fast on invalid option combinations before spawning the
+        # subprocess or touching the session store.
+        validate_options(options)
         validate_session_store_options(options)
 
         # resume/continue + session_store: load the session from the store
@@ -97,78 +98,16 @@ class InternalClient:
         # Connect transport
         await chosen_transport.connect()
 
-        # Extract SDK MCP servers from configured options
-        sdk_mcp_servers = {}
-        if configured_options.mcp_servers and isinstance(
-            configured_options.mcp_servers, dict
-        ):
-            for name, config in configured_options.mcp_servers.items():
-                if isinstance(config, dict) and config.get("type") == "sdk":
-                    sdk_mcp_servers[name] = config["instance"]  # type: ignore[typeddict-item]
-
-        # Extract exclude_dynamic_sections and snapshot from the system prompt
-        # for the initialize request (older CLIs ignore unknown initialize fields).
-        exclude_dynamic_sections: bool | None = None
-        system_prompt_snapshot: bool | None = None
-        sp = configured_options.system_prompt
-        if isinstance(sp, dict) and sp.get("type") == "preset":
-            eds = sp.get("exclude_dynamic_sections")
-            if isinstance(eds, bool):
-                exclude_dynamic_sections = eds
-        if isinstance(sp, dict) and sp.get("type") in ("preset", "custom"):
-            snapshot = sp.get("snapshot")
-            if isinstance(snapshot, bool):
-                system_prompt_snapshot = snapshot
-
-        # Convert agents to dict format for initialize request
-        agents_dict = None
-        if configured_options.agents:
-            agents_dict = {
-                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
-                for name, agent_def in configured_options.agents.items()
-            }
-
-        # Match ClaudeSDKClient.connect() — without this, query() ignores the env var
-        initialize_timeout_ms = int(
-            os.environ.get("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "60000")
-        )
-        initialize_timeout = max(initialize_timeout_ms / 1000.0, 60.0)
-
-        # Create Query to handle control protocol
-        # Always use streaming mode internally (matching TypeScript SDK)
-        # This ensures agents are always sent via initialize request
+        # Create Query to handle control protocol. Always use streaming mode
+        # internally (matching TypeScript SDK) so agents and the other
+        # initialize-request fields are sent via the initialize request. The
+        # kwargs come from the setup helpers shared with ClaudeSDKClient.
         query = Query(
             transport=chosen_transport,
             is_streaming_mode=True,  # Always streaming internally
-            can_use_tool=configured_options.can_use_tool,
-            hooks=_hooks_to_internal_format(configured_options.hooks)
-            if configured_options.hooks
-            else None,
-            sdk_mcp_servers=sdk_mcp_servers,
-            initialize_timeout=initialize_timeout,
-            agents=agents_dict,
-            exclude_dynamic_sections=exclude_dynamic_sections,
-            system_prompt_snapshot=system_prompt_snapshot,
-            skills=configured_options.skills,
-            forward_subagent_text=configured_options.forward_subagent_text,
-            verbatim_prompts=configured_options.verbatim_prompts,
-            run_end_ceiling_ms=run_end_ceiling_ms(configured_options.env),
+            **query_kwargs_for(configured_options),
         )
-
-        if configured_options.session_store is not None:
-
-            async def _on_mirror_error(key: Any, error: str) -> None:
-                query.report_mirror_error(key, error)
-
-            query.set_transcript_mirror_batcher(
-                build_mirror_batcher(
-                    store=configured_options.session_store,
-                    materialized=materialized,
-                    env=configured_options.env,
-                    on_error=_on_mirror_error,
-                    flush_mode=configured_options.session_store_flush,
-                )
-            )
+        attach_session_store(query, configured_options, materialized)
 
         try:
             # Start reading messages

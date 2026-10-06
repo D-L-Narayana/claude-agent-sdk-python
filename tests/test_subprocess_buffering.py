@@ -12,10 +12,18 @@ from claude_agent_sdk._errors import CLIJSONDecodeError
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     _DEFAULT_MAX_BUFFER_SIZE,
     SubprocessCLITransport,
+    clear_cli_version_cache,
 )
 from claude_agent_sdk.types import ClaudeAgentOptions
 
 DEFAULT_CLI_PATH = "/usr/bin/claude"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_version_cache() -> None:
+    """The `claude -v` probe result is cached per binary for the life of the
+    process; start every test from an empty cache."""
+    clear_cli_version_cache()
 
 
 def make_options(**kwargs: object) -> ClaudeAgentOptions:

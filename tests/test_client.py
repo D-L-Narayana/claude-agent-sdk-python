@@ -230,6 +230,47 @@ class TestQueryFunction:
             )
         assert call_kwargs["system_prompt_snapshot"] is expected
 
+    def test_query_constructs_query_from_the_shared_setup_helpers(self):
+        """query() passes Query exactly ``transport``, ``is_streaming_mode`` and
+        the kwargs computed by ``query_kwargs_for`` — no entry-point-local
+        copy of the setup logic."""
+        from claude_agent_sdk import AgentDefinition, HookMatcher
+        from claude_agent_sdk._internal.query_setup import query_kwargs_for
+
+        async def hook(input_data, tool_use_id, context):
+            return {}
+
+        options = ClaudeAgentOptions(
+            hooks={
+                "PreToolUse": [HookMatcher(matcher="Bash", hooks=[hook], timeout=5)]
+            },
+            agents={"reviewer": AgentDefinition(description="d", prompt="p")},
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "exclude_dynamic_sections": True,
+                "snapshot": False,
+            },
+            skills=["reviewer"],
+            forward_subagent_text=True,
+            verbatim_prompts=True,
+            env={"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "4321"},
+        )
+        call_kwargs = self._run_query_with_mocked_internals(
+            env_patch={"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "90000"},
+            expected_timeout=90.0,
+            options=options,
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "90000"}):
+            expected = query_kwargs_for(options)
+        assert call_kwargs.pop("is_streaming_mode") is True
+        call_kwargs.pop("transport")
+        assert call_kwargs == expected
+        assert call_kwargs["run_end_ceiling_ms"] == 4321
+        assert call_kwargs["hooks"] == {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [hook], "timeout": 5}]
+        }
+
     def test_string_prompt_spawns_wait_for_result_as_task(self):
         """Test that string prompts spawn wait_for_result_and_end_input as a background
         task instead of awaiting it inline, preventing deadlock when the message
@@ -422,6 +463,59 @@ class TestClaudeSDKClientSystemPromptSnapshot:
             )
         )
         assert "systemPromptSnapshot" not in request
+
+
+class TestClaudeSDKClientQuerySetupParity:
+    """ClaudeSDKClient.connect() builds Query from the same shared helpers."""
+
+    def test_connect_constructs_query_from_the_shared_setup_helpers(self):
+        from claude_agent_sdk import AgentDefinition, ClaudeSDKClient, HookMatcher
+        from claude_agent_sdk._internal.query_setup import query_kwargs_for
+
+        async def hook(input_data, tool_use_id, context):
+            return {}
+
+        options = ClaudeAgentOptions(
+            hooks={"Stop": [HookMatcher(hooks=[hook])]},
+            agents={"reviewer": AgentDefinition(description="d", prompt="p")},
+            system_prompt={"type": "custom", "prompt": "Be helpful", "snapshot": True},
+            skills="all",
+            forward_subagent_text=True,
+            verbatim_prompts=True,
+            env={"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"},
+        )
+        captured: dict = {}
+
+        async def _test():
+            with (
+                patch("claude_agent_sdk._internal.query.Query") as mock_query_class,
+                patch.dict(os.environ, {"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "90000"}),
+            ):
+                mock_query = AsyncMock()
+                mock_query_class.return_value = mock_query
+                mock_query.close_receive_stream = Mock()
+                mock_query.spawn_task = Mock()
+
+                mock_transport = AsyncMock()
+                mock_transport.is_ready = Mock(return_value=True)
+
+                async with ClaudeSDKClient(options=options, transport=mock_transport):
+                    pass
+
+                mock_query_class.assert_called_once()
+                captured["call"] = dict(mock_query_class.call_args.kwargs)
+                captured["transport"] = mock_transport
+                captured["expected"] = query_kwargs_for(options)
+
+        anyio.run(_test)
+        call_kwargs = captured["call"]
+        assert call_kwargs.pop("transport") is captured["transport"]
+        assert call_kwargs.pop("is_streaming_mode") is True
+        assert call_kwargs == captured["expected"]
+        assert call_kwargs["initialize_timeout"] == 90.0
+        assert call_kwargs["run_end_ceiling_ms"] == 0
+        assert call_kwargs["system_prompt_snapshot"] is True
+        assert call_kwargs["skills"] == "all"
 
 
 class TestClaudeSDKClientResourceCleanup:

@@ -1,9 +1,7 @@
 """Claude SDK Client for interacting with Claude Code."""
 
 import json
-import os
 from collections.abc import AsyncIterable, AsyncIterator
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from . import Transport
@@ -11,6 +9,10 @@ from ._errors import CLIConnectionError
 
 if TYPE_CHECKING:
     from ._internal.session_resume import MaterializedResume
+    from ._internal.transcript_mirror_batcher import (
+        MirrorStats,
+        TranscriptMirrorBatcher,
+    )
 from .types import (
     ClaudeAgentOptions,
     ContextUsageResponse,
@@ -19,8 +21,11 @@ from .types import (
     PermissionMode,
     ResultMessage,
     _configure_can_use_tool,
-    _hooks_to_internal_format,
 )
+
+# Frame types whose ``session_id`` the client tracks (plus ``init`` system
+# frames, which carry the id the CLI assigned when the session started).
+_SESSION_ID_FRAME_TYPES = frozenset({"assistant", "result"})
 
 
 class ClaudeSDKClient:
@@ -89,12 +94,73 @@ class ClaudeSDKClient:
         # consistently, matching the value Query uses for streamed prompts.
         self._verbatim_prompts = False
         self._materialized: MaterializedResume | None = None
+        # Last session_id seen on an init/assistant/result frame; see session_id.
+        self._session_id: str | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        """The CLI's session ID for the current conversation, or ``None``.
+
+        Taken from the last ``init`` system, ``AssistantMessage`` or
+        ``ResultMessage`` frame that passed through :meth:`receive_messages`
+        (or :meth:`receive_response`), so it is ``None`` until the first such
+        frame has been read, and it reflects a forked session once the CLI
+        reports the new ID. Keep it to ``resume`` the conversation later::
+
+            async with ClaudeSDKClient() as client:
+                await client.query("Hello")
+                async for _ in client.receive_response():
+                    pass
+                saved = client.session_id
+
+            options = ClaudeAgentOptions(resume=saved)
+
+        The value survives :meth:`disconnect` and is reset by the next
+        :meth:`connect`.
+        """
+        return self._session_id
+
+    @property
+    def cli_version(self) -> str | None:
+        """Version of the Claude Code CLI the client is connected to, or ``None``.
+
+        Read from the transport's ``cli_version`` attribute, so it is ``None``
+        before :meth:`connect`, after :meth:`disconnect`, when the version
+        probe was skipped (``CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK``) or could
+        not be parsed, and for custom transports that do not expose one.
+        """
+        version = getattr(self._transport, "cli_version", None)
+        return version if isinstance(version, str) else None
+
+    @property
+    def mirror_stats(self) -> "MirrorStats | None":
+        """Lifetime transcript-mirror counters for this session, or ``None``.
+
+        ``None`` when no ``session_store`` is configured, before
+        :meth:`connect` and after :meth:`disconnect`. Each read returns a
+        fresh snapshot; a non-zero ``batches_failed`` / ``entries_dropped``
+        means the store is missing entries (each drop was also surfaced as a
+        ``MirrorErrorMessage``).
+        """
+        if self._query is None:
+            return None
+        batcher: TranscriptMirrorBatcher | None = self._query._transcript_mirror_batcher
+        return batcher.stats if batcher is not None else None
 
     async def connect(
         self, prompt: str | AsyncIterable[dict[str, Any]] | None = None
     ) -> None:
-        """Connect to Claude with a prompt or message stream."""
+        """Connect to Claude with a prompt or message stream.
 
+        Raises:
+            ValueError: If ``options`` combine settings the SDK cannot honor
+                (for example ``resume`` with ``continue_conversation``, or
+                ``session_id`` with ``resume`` without ``fork_session``). Raised
+                before the subprocess is spawned and before any session store
+                is read.
+        """
+
+        from ._internal.options_validation import validate_options
         from ._internal.session_resume import materialize_resume_session
         from ._internal.session_store_validation import validate_session_store_options
 
@@ -110,9 +176,13 @@ class ClaudeSDKClient:
         # only needs an AsyncIterable (or an empty stream for None/str cases).
         actual_prompt = prompt if isinstance(prompt, AsyncIterable) else _empty_stream()
 
-        # Fail fast on invalid session_store option combinations before
-        # spawning the subprocess.
+        # Fail fast on invalid option combinations before spawning the
+        # subprocess or touching the session store.
+        validate_options(self.options)
         validate_session_store_options(self.options)
+
+        # A new connection starts a new session; forget the previous one's id.
+        self._session_id = None
 
         # resume/continue + session_store: load the session from the store
         # into a temp CLAUDE_CONFIG_DIR for the subprocess to resume from.
@@ -143,11 +213,9 @@ class ClaudeSDKClient:
         prompt: str | AsyncIterable[dict[str, Any]] | None,
         actual_prompt: AsyncIterable[dict[str, Any]],
     ) -> None:
-        from ._internal.query import Query, run_end_ceiling_ms, stamp_user_message
-        from ._internal.session_resume import (
-            apply_materialized_options,
-            build_mirror_batcher,
-        )
+        from ._internal.query import Query, stamp_user_message
+        from ._internal.query_setup import attach_session_store, query_kwargs_for
+        from ._internal.session_resume import apply_materialized_options
         from ._internal.transport.subprocess_cli import SubprocessCLITransport
 
         # Validate and configure permission settings (matching TypeScript SDK logic)
@@ -166,78 +234,16 @@ class ClaudeSDKClient:
             )
         await self._transport.connect()
 
-        # Extract SDK MCP servers from options
-        sdk_mcp_servers = {}
-        if self.options.mcp_servers and isinstance(self.options.mcp_servers, dict):
-            for name, config in self.options.mcp_servers.items():
-                if isinstance(config, dict) and config.get("type") == "sdk":
-                    sdk_mcp_servers[name] = config["instance"]  # type: ignore[typeddict-item]
+        self._verbatim_prompts = options.verbatim_prompts
 
-        # Calculate initialize timeout from CLAUDE_CODE_STREAM_CLOSE_TIMEOUT env var if set
-        # CLAUDE_CODE_STREAM_CLOSE_TIMEOUT is in milliseconds, convert to seconds
-        initialize_timeout_ms = int(
-            os.environ.get("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "60000")
-        )
-        initialize_timeout = max(initialize_timeout_ms / 1000.0, 60.0)
-
-        # Extract exclude_dynamic_sections and snapshot from the system prompt
-        # for the initialize request (older CLIs ignore unknown initialize fields).
-        exclude_dynamic_sections: bool | None = None
-        system_prompt_snapshot: bool | None = None
-        sp = self.options.system_prompt
-        if isinstance(sp, dict) and sp.get("type") == "preset":
-            eds = sp.get("exclude_dynamic_sections")
-            if isinstance(eds, bool):
-                exclude_dynamic_sections = eds
-        if isinstance(sp, dict) and sp.get("type") in ("preset", "custom"):
-            snapshot = sp.get("snapshot")
-            if isinstance(snapshot, bool):
-                system_prompt_snapshot = snapshot
-
-        # Convert agents to dict format for initialize request
-        agents_dict: dict[str, dict[str, Any]] | None = None
-        if self.options.agents:
-            agents_dict = {
-                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
-                for name, agent_def in self.options.agents.items()
-            }
-
-        self._verbatim_prompts = self.options.verbatim_prompts
-
-        # Create Query to handle control protocol
+        # Create Query to handle control protocol. The kwargs come from the
+        # setup helpers shared with query() so the two entry points agree.
         self._query = Query(
             transport=self._transport,
             is_streaming_mode=True,  # ClaudeSDKClient always uses streaming mode
-            can_use_tool=self.options.can_use_tool,
-            hooks=_hooks_to_internal_format(self.options.hooks)
-            if self.options.hooks
-            else None,
-            sdk_mcp_servers=sdk_mcp_servers,
-            initialize_timeout=initialize_timeout,
-            agents=agents_dict,
-            exclude_dynamic_sections=exclude_dynamic_sections,
-            system_prompt_snapshot=system_prompt_snapshot,
-            skills=self.options.skills,
-            forward_subagent_text=self.options.forward_subagent_text,
-            verbatim_prompts=self._verbatim_prompts,
-            run_end_ceiling_ms=run_end_ceiling_ms(self.options.env),
+            **query_kwargs_for(options),
         )
-
-        if self.options.session_store is not None:
-            q = self._query
-
-            async def _on_mirror_error(key: Any, error: str) -> None:
-                q.report_mirror_error(key, error)
-
-            self._query.set_transcript_mirror_batcher(
-                build_mirror_batcher(
-                    store=self.options.session_store,
-                    materialized=self._materialized,
-                    env=self.options.env,
-                    on_error=_on_mirror_error,
-                    flush_mode=self.options.session_store_flush,
-                )
-            )
+        attach_session_store(self._query, options, self._materialized)
 
         # Start reading messages and initialize
         await self._query.start()
@@ -265,6 +271,16 @@ class ClaudeSDKClient:
         from ._internal.message_parser import parse_message
 
         async for data in self._query.receive_messages():
+            # Track the session id cheaply (one dict lookup per frame, a second
+            # one only for system frames) so session_id reflects the latest
+            # init/assistant/result frame the consumer has read.
+            frame_type = data.get("type")
+            if frame_type in _SESSION_ID_FRAME_TYPES or (
+                frame_type == "system" and data.get("subtype") == "init"
+            ):
+                session_id = data.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    self._session_id = session_id
             message = parse_message(data)
             if message is not None:
                 yield message

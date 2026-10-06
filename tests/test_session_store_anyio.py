@@ -110,6 +110,42 @@ async def test_batcher_close_flushes_under_cancelled_scope() -> None:
     assert len(store.calls) == 1
 
 
+async def test_batcher_stats_after_eager_flush() -> None:
+    """The eager (``spawn_detached``) path updates the same counters as an
+    explicit flush — on both backends."""
+    store = _RecordingStore()
+    b = _batcher(store, max_pending_entries=0)
+    b.enqueue("/tmp/p/proj/sid.jsonl", [_entry("a"), _entry("b")])
+    await anyio.sleep(0.05)
+    assert len(store.calls) == 1
+    s = b.stats
+    assert (s.frames_enqueued, s.entries_enqueued) == (1, 2)
+    assert (s.flushes, s.entries_flushed) == (1, 2)
+    assert (s.batches_failed, s.entries_dropped) == (0, 0)
+
+
+async def test_batcher_stats_after_timeout_drop() -> None:
+    store = _RecordingStore(delay=10.0)
+    errors: list[str] = []
+
+    async def _on_error(_key: SessionKey | None, msg: str) -> None:
+        errors.append(msg)
+
+    b = TranscriptMirrorBatcher(
+        store=cast(SessionStore, store),
+        projects_dir="/tmp/p",
+        on_error=_on_error,
+        send_timeout=0.05,
+    )
+    b.enqueue("/tmp/p/proj/sid.jsonl", [_entry("a")])
+    await b.flush()
+    assert len(errors) == 1
+    s = b.stats
+    assert (s.frames_enqueued, s.entries_enqueued) == (1, 1)
+    assert (s.flushes, s.entries_flushed) == (1, 0)
+    assert (s.batches_failed, s.entries_dropped) == (1, 1)
+
+
 # ---------------------------------------------------------------------------
 # session_resume helpers
 # ---------------------------------------------------------------------------

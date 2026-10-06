@@ -15,11 +15,14 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     CLIConnectionError,
+    InMemorySessionStore,
     ResultMessage,
     TextBlock,
+    Transport,
     UserMessage,
     query,
 )
+from claude_agent_sdk._internal.transcript_mirror_batcher import MirrorStats
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 
@@ -1023,6 +1026,350 @@ class TestClaudeSDKClientStreaming:
 
                 assert len(received) == 1
                 assert isinstance(received[0], AssistantMessage)
+
+
+def _init_frame(session_id: str) -> dict[str, Any]:
+    return {
+        "type": "system",
+        "subtype": "init",
+        "session_id": session_id,
+        "cwd": "/work",
+        "tools": ["Read"],
+        "mcp_servers": [],
+        "model": "claude-opus-4-1-20250805",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+    }
+
+
+def _assistant_frame(session_id: str, text: str = "Hi") -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": "claude-opus-4-1-20250805",
+        },
+        "session_id": session_id,
+    }
+
+
+def _result_frame(session_id: str) -> dict[str, Any]:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "duration_ms": 1,
+        "duration_api_ms": 1,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": session_id,
+        "total_cost_usd": 0.0,
+    }
+
+
+def _mock_transport_yielding(
+    frames: list[dict[str, Any]], release: anyio.Event | None = None
+):
+    """Mock transport that answers the initialize handshake, then yields ``frames``.
+
+    When ``release`` is given, the frames are held back until the event is
+    set, so a test can observe client state after ``connect()`` returns but
+    before any frame can have reached the Query's reader task — independent
+    of how the backend schedules that task.
+    """
+    mock_transport = create_mock_transport()
+
+    async def mock_receive():
+        await anyio.sleep(0.01)
+        for call in mock_transport.write.call_args_list:
+            try:
+                msg = json.loads(call[0][0].strip())
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if (
+                msg.get("type") == "control_request"
+                and msg.get("request", {}).get("subtype") == "initialize"
+            ):
+                yield {
+                    "type": "control_response",
+                    "response": {
+                        "request_id": msg.get("request_id"),
+                        "subtype": "success",
+                        "commands": [],
+                        "output_style": "default",
+                    },
+                }
+                break
+        if release is not None:
+            await release.wait()
+        for frame in frames:
+            yield frame
+
+    mock_transport.read_messages = mock_receive
+    return mock_transport
+
+
+class TestClaudeSDKClientSessionId:
+    """``client.session_id`` follows the session id of the frames received."""
+
+    def test_none_before_connect(self):
+        assert ClaudeSDKClient().session_id is None
+
+    @pytest.mark.anyio
+    async def test_none_before_any_frame(self):
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = create_mock_transport()
+            async with ClaudeSDKClient() as client:
+                assert client.session_id is None
+
+    @pytest.mark.anyio
+    async def test_follows_init_assistant_and_result_frames(self):
+        frames = [
+            _init_frame("sess-init"),
+            _assistant_frame("sess-assistant"),
+            # Other frame types carry a session_id too but are not tracked.
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "echo"},
+                "session_id": "not-tracked-user",
+            },
+            {
+                "type": "system",
+                "subtype": "status",
+                "status": "compacting",
+                "permission_mode": "default",
+                "session_id": "not-tracked-status",
+            },
+            _result_frame("sess-result"),
+        ]
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = _mock_transport_yielding(frames)
+
+            async with ClaudeSDKClient() as client:
+                observed: list[str | None] = []
+                async for message in client.receive_messages():
+                    observed.append(client.session_id)
+                    if isinstance(message, ResultMessage):
+                        break
+
+        assert observed == [
+            "sess-init",
+            "sess-assistant",
+            "sess-assistant",
+            "sess-assistant",
+            "sess-result",
+        ]
+        # The last value survives disconnect() so it can seed a later resume.
+        assert client.session_id == "sess-result"
+
+    @pytest.mark.anyio
+    async def test_receive_response_tracks_too(self):
+        frames = [_assistant_frame("sess-a"), _result_frame("sess-a")]
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = _mock_transport_yielding(frames)
+            async with ClaudeSDKClient() as client:
+                messages = [msg async for msg in client.receive_response()]
+                assert isinstance(messages[-1], ResultMessage)
+                assert client.session_id == "sess-a"
+
+    @pytest.mark.anyio
+    async def test_empty_and_non_string_values_are_ignored(self):
+        frames = [
+            _init_frame("sess-init"),
+            {**_assistant_frame("x"), "session_id": ""},
+            {**_assistant_frame("x"), "session_id": None},
+            {k: v for k, v in _assistant_frame("x").items() if k != "session_id"},
+            _result_frame("sess-result"),
+        ]
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = _mock_transport_yielding(frames)
+            async with ClaudeSDKClient() as client:
+                observed: list[str | None] = []
+                async for message in client.receive_messages():
+                    observed.append(client.session_id)
+                    if isinstance(message, ResultMessage):
+                        break
+        assert observed == ["sess-init"] * 4 + ["sess-result"]
+
+    @pytest.mark.anyio
+    async def test_reset_on_reconnect(self):
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.side_effect = [
+                _mock_transport_yielding([_result_frame("first")]),
+                create_mock_transport(),
+            ]
+            client = ClaudeSDKClient()
+            await client.connect()
+            async for _ in client.receive_response():
+                pass
+            assert client.session_id == "first"
+            await client.disconnect()
+            assert client.session_id == "first"
+
+            await client.connect()
+            assert client.session_id is None
+            await client.disconnect()
+
+
+async def _no_messages():
+    return
+    yield  # pragma: no cover
+
+
+class _BareTransport(Transport):
+    """Minimal custom Transport without a ``cli_version`` attribute."""
+
+    async def connect(self) -> None:
+        pass
+
+    async def write(self, data: str) -> None:
+        pass
+
+    def read_messages(self):
+        return _no_messages()
+
+    async def close(self) -> None:
+        pass
+
+    def is_ready(self) -> bool:
+        return True
+
+    async def end_input(self) -> None:
+        pass
+
+
+class _VersionedTransport(_BareTransport):
+    cli_version = "2.1.283"
+
+
+class TestClaudeSDKClientCliVersion:
+    """``client.cli_version`` passes through the transport's ``cli_version``."""
+
+    def test_none_before_connect(self):
+        assert ClaudeSDKClient().cli_version is None
+
+    @pytest.mark.anyio
+    async def test_none_when_transport_lacks_the_attribute(self):
+        with patch(
+            "claude_agent_sdk._internal.query.Query.initialize", new_callable=AsyncMock
+        ):
+            async with ClaudeSDKClient(transport=_BareTransport()) as client:
+                assert client.cli_version is None
+
+    @pytest.mark.anyio
+    async def test_value_when_transport_exposes_the_attribute(self):
+        with patch(
+            "claude_agent_sdk._internal.query.Query.initialize", new_callable=AsyncMock
+        ):
+            async with ClaudeSDKClient(transport=_VersionedTransport()) as client:
+                assert client.cli_version == "2.1.283"
+
+    @pytest.mark.anyio
+    async def test_mock_transport_placeholder_is_not_a_version(self):
+        """AsyncMock fabricates attributes on access; a non-string placeholder
+        must not leak out as the CLI version."""
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = create_mock_transport()
+            async with ClaudeSDKClient() as client:
+                assert client.cli_version is None
+
+    @pytest.mark.anyio
+    async def test_none_after_disconnect(self):
+        with patch(
+            "claude_agent_sdk._internal.query.Query.initialize", new_callable=AsyncMock
+        ):
+            client = ClaudeSDKClient(transport=_VersionedTransport())
+            await client.connect()
+            assert client.cli_version == "2.1.283"
+            await client.disconnect()
+        assert client.cli_version is None
+
+
+class TestClaudeSDKClientMirrorStats:
+    """``client.mirror_stats`` exposes the transcript-mirror batcher counters."""
+
+    def test_none_before_connect(self):
+        assert ClaudeSDKClient().mirror_stats is None
+        assert (
+            ClaudeSDKClient(
+                ClaudeAgentOptions(session_store=InMemorySessionStore())
+            ).mirror_stats
+            is None
+        )
+
+    @pytest.mark.anyio
+    async def test_none_without_a_session_store(self):
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = _mock_transport_yielding(
+                [_result_frame("sess")]
+            )
+            async with ClaudeSDKClient() as client:
+                assert client.mirror_stats is None
+                async for _ in client.receive_response():
+                    pass
+                assert client.mirror_stats is None
+
+    @pytest.mark.anyio
+    async def test_counts_entries_flushed_on_result(self, tmp_path):
+        store = InMemorySessionStore()
+        options = ClaudeAgentOptions(
+            session_store=store, env={"CLAUDE_CONFIG_DIR": str(tmp_path)}
+        )
+        file_path = str(tmp_path / "projects" / "proj" / "sess.jsonl")
+        frames = [
+            {
+                "type": "transcript_mirror",
+                "filePath": file_path,
+                "entries": [{"type": "user", "uuid": "u1"}, {"type": "assistant"}],
+            },
+            _result_frame("sess"),
+        ]
+        # The frames are held back until `release` is set, so the "nothing
+        # flushed yet" snapshot below is deterministic on both backends (the
+        # reader task cannot consume the frames before the test body resumes).
+        release = anyio.Event()
+        with patch(
+            "claude_agent_sdk._internal.transport.subprocess_cli.SubprocessCLITransport"
+        ) as mock_transport_class:
+            mock_transport_class.return_value = _mock_transport_yielding(
+                frames, release
+            )
+            async with ClaudeSDKClient(options=options) as client:
+                before = client.mirror_stats
+                assert isinstance(before, MirrorStats)
+                assert before.entries_flushed == 0
+                release.set()
+
+                messages = [msg async for msg in client.receive_response()]
+                assert isinstance(messages[-1], ResultMessage)
+
+                stats = client.mirror_stats
+                assert isinstance(stats, MirrorStats)
+                assert stats.frames_enqueued == 1
+                assert stats.entries_enqueued == 2
+                assert stats.entries_flushed >= 1
+                assert stats.batches_failed == 0
+                assert stats.entries_dropped == 0
+        assert await store.load({"project_key": "proj", "session_id": "sess"}) == [
+            {"type": "user", "uuid": "u1"},
+            {"type": "assistant"},
+        ]
+        # After disconnect() the batcher is gone with the query.
+        assert client.mirror_stats is None
 
 
 class TestQueryWithAsyncIterable:

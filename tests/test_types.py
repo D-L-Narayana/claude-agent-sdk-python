@@ -1,6 +1,9 @@
 """Tests for Claude SDK type definitions."""
 
+from dataclasses import MISSING, fields, is_dataclass
 from typing import get_args
+
+import pytest
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -15,14 +18,26 @@ from claude_agent_sdk import (
     SubagentStartHookSpecificOutput,
 )
 from claude_agent_sdk.types import (
+    AuthStatusMessage,
+    CompactBoundaryMessage,
+    ContentBlock,
+    InitMessage,
+    Message,
     PermissionRuleValue,
     PermissionUpdate,
     PostToolUseHookSpecificOutput,
     PreToolUseHookSpecificOutput,
+    RedactedThinkingBlock,
+    ServerToolResultBlock,
+    StatusMessage,
+    SystemMessage,
     TextBlock,
     ThinkingBlock,
+    ToolProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseSummaryMessage,
+    UnknownBlock,
     UserMessage,
 )
 
@@ -730,3 +745,178 @@ class TestAgentDefinition:
         assert "background" not in payload
         assert "effort" not in payload
         assert "permissionMode" not in payload
+
+
+def _required_field_names(cls: type) -> set[str]:
+    """Names of dataclass fields with neither a default nor a default_factory."""
+    return {
+        f.name
+        for f in fields(cls)
+        if f.default is MISSING and f.default_factory is MISSING
+    }
+
+
+class TestMessageModelAdditions:
+    """New message/block dataclasses: defaults, SystemMessage lineage, unions."""
+
+    NEW_TYPES = [
+        InitMessage,
+        CompactBoundaryMessage,
+        StatusMessage,
+        ToolProgressMessage,
+        ToolUseSummaryMessage,
+        AuthStatusMessage,
+        RedactedThinkingBlock,
+        UnknownBlock,
+    ]
+
+    @pytest.mark.parametrize("cls", NEW_TYPES)
+    def test_new_types_are_dataclasses(self, cls):
+        assert is_dataclass(cls)
+
+    @pytest.mark.parametrize(
+        ("cls", "required"),
+        [
+            (InitMessage, {"subtype", "data"}),
+            (CompactBoundaryMessage, {"subtype", "data"}),
+            (StatusMessage, {"subtype", "data"}),
+            (
+                ToolProgressMessage,
+                {"tool_use_id", "tool_name", "elapsed_time_seconds"},
+            ),
+            (ToolUseSummaryMessage, {"summary"}),
+            (AuthStatusMessage, {"is_authenticating"}),
+            (RedactedThinkingBlock, {"data"}),
+            (UnknownBlock, {"type", "data"}),
+        ],
+    )
+    def test_only_contracted_fields_are_required(self, cls, required):
+        """Every field beyond the contracted identity fields has a default."""
+        assert _required_field_names(cls) == required
+
+    def test_init_message_field_names_match_contract(self):
+        assert {f.name for f in fields(InitMessage)} == {
+            "subtype",
+            "data",
+            "session_id",
+            "model",
+            "cwd",
+            "tools",
+            "mcp_servers",
+            "permission_mode",
+            "api_key_source",
+            "slash_commands",
+            "agents",
+            "skills",
+            "plugins",
+            "output_style",
+            "claude_code_version",
+            "betas",
+            "uuid",
+        }
+
+    @pytest.mark.parametrize(
+        "cls", [InitMessage, CompactBoundaryMessage, StatusMessage]
+    )
+    def test_system_subclasses_construct_from_base_fields_only(self, cls):
+        message = cls(subtype="x", data={"type": "system", "subtype": "x"})
+        assert isinstance(message, SystemMessage)
+        assert issubclass(cls, SystemMessage)
+        assert message.subtype == "x"
+        assert message.data == {"type": "system", "subtype": "x"}
+
+    def test_init_message_defaults(self):
+        first = InitMessage(subtype="init", data={})
+        second = InitMessage(subtype="init", data={})
+        assert first.session_id is None
+        assert first.model is None
+        assert first.cwd is None
+        assert first.permission_mode is None
+        assert first.api_key_source is None
+        assert first.output_style is None
+        assert first.claude_code_version is None
+        assert first.uuid is None
+        for name in (
+            "tools",
+            "mcp_servers",
+            "slash_commands",
+            "agents",
+            "skills",
+            "plugins",
+            "betas",
+        ):
+            assert getattr(first, name) == []
+            # Mutable defaults are per-instance, not shared.
+            assert getattr(first, name) is not getattr(second, name)
+
+    def test_compact_boundary_and_status_defaults(self):
+        boundary = CompactBoundaryMessage(subtype="compact_boundary", data={})
+        assert boundary.trigger is None
+        assert boundary.pre_tokens is None
+        assert boundary.session_id is None
+        assert boundary.uuid is None
+        status = StatusMessage(subtype="status", data={})
+        assert status.status is None
+        assert status.permission_mode is None
+        assert status.session_id is None
+        assert status.uuid is None
+
+    def test_tool_progress_defaults(self):
+        message = ToolProgressMessage(
+            tool_use_id="toolu_1", tool_name="Bash", elapsed_time_seconds=1.5
+        )
+        assert message.parent_tool_use_id is None
+        assert message.uuid is None
+        assert message.session_id is None
+        assert message.data == {}
+
+    def test_tool_use_summary_defaults(self):
+        message = ToolUseSummaryMessage(summary="did things")
+        assert message.preceding_tool_use_ids == []
+        assert message.uuid is None
+        assert message.session_id is None
+        assert message.data == {}
+
+    def test_auth_status_defaults(self):
+        message = AuthStatusMessage(is_authenticating=True)
+        assert message.output == []
+        assert message.error is None
+        assert message.uuid is None
+        assert message.session_id is None
+        assert message.data == {}
+
+    def test_thinking_block_signature_defaults_to_empty(self):
+        assert ThinkingBlock(thinking="x").signature == ""
+        assert ThinkingBlock(thinking="x", signature="sig").signature == "sig"
+
+    def test_server_tool_result_block_accepts_dict_and_list_content(self):
+        as_dict = ServerToolResultBlock(tool_use_id="a", content={"type": "r"})
+        as_list = ServerToolResultBlock(tool_use_id="b", content=[{"type": "r"}])
+        assert as_dict.content == {"type": "r"}
+        assert as_list.content == [{"type": "r"}]
+
+    def test_redacted_thinking_and_unknown_block_construct(self):
+        redacted = RedactedThinkingBlock(data="opaque")
+        assert redacted.data == "opaque"
+        unknown = UnknownBlock(type="image", data={"type": "image", "source": {}})
+        assert unknown.type == "image"
+        assert unknown.data["source"] == {}
+
+    def test_message_union_includes_new_top_level_types(self):
+        members = set(get_args(Message))
+        assert {ToolProgressMessage, ToolUseSummaryMessage, AuthStatusMessage} <= (
+            members
+        )
+        # Existing members are untouched.
+        assert {UserMessage, AssistantMessage, SystemMessage, ResultMessage} <= members
+
+    def test_content_block_union_includes_new_blocks(self):
+        members = set(get_args(ContentBlock))
+        assert {RedactedThinkingBlock, UnknownBlock} <= members
+        assert {
+            TextBlock,
+            ThinkingBlock,
+            ToolUseBlock,
+            ToolResultBlock,
+            ServerToolResultBlock,
+        } <= members

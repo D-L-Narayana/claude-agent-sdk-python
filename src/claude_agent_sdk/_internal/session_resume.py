@@ -9,6 +9,10 @@ from the store, writes it to a temporary directory laid out exactly like
 it via ``CLAUDE_CONFIG_DIR``.
 
 Mirrors the behavior of the TypeScript SDK.
+
+The subagent writer (:func:`_write_session_subkeys`) is shared with
+:mod:`session_export`, which lays a store-held session out the same way but
+in the *real* projects directory so the plain CLI can ``--resume`` it.
 """
 
 from __future__ import annotations
@@ -298,18 +302,33 @@ async def _resolve_continue_candidate(
     return None
 
 
-async def _with_timeout(coro: Awaitable[Any], timeout_s: float, what: str) -> Any:
-    """Await ``coro`` with a timeout, re-raising as ``RuntimeError`` with context."""
+# Operation name used in ``_with_timeout`` errors raised by the resume path.
+_RESUME_PHASE = "resume materialization"
+
+
+async def _with_timeout(
+    coro: Awaitable[Any],
+    timeout_s: float,
+    what: str,
+    *,
+    phase: str = _RESUME_PHASE,
+) -> Any:
+    """Await ``coro`` with a timeout, re-raising as ``RuntimeError`` with context.
+
+    ``what`` names the store call (e.g. ``"SessionStore.load() for session
+    <id>"``); ``phase`` names the operation it belongs to and defaults to the
+    resume path's wording. ``export_session_from_store`` passes its own so
+    its errors read ``"... during session export"``.
+    """
     try:
         with anyio.fail_after(timeout_s):
             return await coro
     except TimeoutError as e:
         raise RuntimeError(
-            f"{what} timed out after {int(timeout_s * 1000)}ms during resume "
-            f"materialization"
+            f"{what} timed out after {int(timeout_s * 1000)}ms during {phase}"
         ) from e
     except Exception as e:  # noqa: BLE001 - surface adapter failures with context
-        raise RuntimeError(f"{what} failed during resume materialization: {e}") from e
+        raise RuntimeError(f"{what} failed during {phase}: {e}") from e
 
 
 def _write_jsonl(path: Path, entries: list[Any]) -> None:
@@ -537,12 +556,55 @@ async def _materialize_subkeys(
     session_id: str,
     timeout_s: float,
 ) -> None:
-    """Load and write all subagent transcripts/metadata under ``session_id``."""
-    session_dir = project_dir / session_id
+    """Load and write all subagent transcripts/metadata under ``session_id``.
+
+    Thin wrapper over :func:`_write_session_subkeys` for the resume path:
+    the session directory is ``project_dir / session_id`` inside the temp
+    ``CLAUDE_CONFIG_DIR`` (``tmp_base``, which is implied by ``project_dir``
+    and kept for signature compatibility).
+    """
+    await _write_session_subkeys(
+        store, project_dir / session_id, project_key, session_id, timeout_s
+    )
+
+
+async def _write_session_subkeys(
+    store: SessionStore,
+    session_dir: Path,
+    project_key: str,
+    session_id: str,
+    timeout_s: float,
+    *,
+    phase: str = _RESUME_PHASE,
+) -> None:
+    """Write every subpath of ``session_id`` held in ``store`` under ``session_dir``.
+
+    Lays subagent data out exactly as the CLI does: a subpath such as
+    ``subagents/agent-<id>`` (or ``subagents/workflows/<runId>/agent-<id>``)
+    becomes ``<session_dir>/<subpath>.jsonl`` holding its transcript lines,
+    and a synthetic ``agent_metadata`` entry in the same stream — the store's
+    copy of the CLI's sidecar; the last one wins because it is rewritten on
+    resume — becomes ``<session_dir>/<subpath>.meta.json`` with the ``type``
+    discriminator stripped. Files are written with mode 0o600 and parent
+    directories are created as needed.
+
+    Subpaths come from an external store and are used as filesystem path
+    components, so anything that would escape ``session_dir`` (see
+    :func:`_is_safe_subpath`) is skipped with a warning before it is loaded;
+    subpaths whose ``load()`` returns nothing are skipped silently. Store
+    calls run under :func:`_with_timeout`, with ``phase`` naming the caller
+    in the resulting ``RuntimeError``.
+
+    Shared by :func:`materialize_resume_session` (``session_dir`` inside the
+    temp ``CLAUDE_CONFIG_DIR``) and ``export_session_from_store``
+    (``session_dir`` inside a staging directory that is moved into the real
+    projects directory once every store call has succeeded).
+    """
     subkeys = await _with_timeout(
         store.list_subkeys({"project_key": project_key, "session_id": session_id}),
         timeout_s,
         f"SessionStore.list_subkeys() for session {session_id}",
+        phase=phase,
     )
     for subpath in subkeys:
         # Subpaths come from an external store and are used as filesystem path
@@ -564,6 +626,7 @@ async def _materialize_subkeys(
             store.load(sub_key),
             timeout_s,
             f"SessionStore.load() for session {session_id} subpath {subpath}",
+            phase=phase,
         )
         if not sub_entries:
             continue
@@ -609,8 +672,8 @@ def _is_safe_subpath(subpath: str, session_dir: Path) -> bool:
     if "\x00" in subpath:
         return False
     # Resolve the .jsonl target — using the same expression as the writer in
-    # _materialize_subkeys so the validated path can't drift from the written
-    # one — and confirm it stays under session_dir. Both ``.resolve()`` calls
+    # _write_session_subkeys so the validated path can't drift from the
+    # written one — and confirm it stays under session_dir. Both ``.resolve()`` calls
     # can raise (e.g. ValueError on embedded NUL, OSError on broken symlink
     # chains); treat any resolution failure as unsafe so the subpath is
     # skipped with a warning rather than aborting the whole resume.

@@ -15,6 +15,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
+from claude_agent_sdk._internal.abort_signal import AbortSignal
 from claude_agent_sdk._internal.query import Query
 from claude_agent_sdk._internal.transport import Transport
 
@@ -635,6 +636,124 @@ class TestHookCallbacks:
         assert result.get("asyncTimeout") == 10000
         assert result.get("stopReason") == "Testing field conversion"
         assert result.get("systemMessage") == "Fields should be converted"
+
+
+class TestAbortSignalDelivery:
+    """Every callback invocation receives a live ``AbortSignal`` (never None).
+
+    The signal is per request: it stays un-aborted for a request that runs to
+    completion, and ``on_abort`` callbacks registered by the user never fire
+    for such a request.
+    """
+
+    @staticmethod
+    def _permission_request(request_id: str) -> dict[str, Any]:
+        return {
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "TestTool",
+                "input": {"param": "value"},
+                "permission_suggestions": [],
+                "tool_use_id": f"toolu_{request_id}",
+            },
+        }
+
+    @pytest.mark.anyio
+    async def test_can_use_tool_receives_abort_signal(self):
+        received: list[ToolPermissionContext] = []
+        fired: list[str | None] = []
+
+        async def capture(
+            tool_name: str, input_data: dict, context: ToolPermissionContext
+        ) -> PermissionResultAllow:
+            received.append(context)
+            context.signal.on_abort(lambda s: fired.append(s.reason))
+            return PermissionResultAllow()
+
+        transport = MockTransport()
+        query = Query(
+            transport=transport,
+            is_streaming_mode=True,
+            can_use_tool=capture,
+            hooks=None,
+        )
+
+        await query._handle_control_request(self._permission_request("test-signal"))
+
+        assert len(received) == 1
+        signal = received[0].signal
+        assert isinstance(signal, AbortSignal)
+        assert signal.aborted is False
+        assert signal.reason is None
+        # A request that completes normally is never aborted.
+        assert fired == []
+        assert len(transport.written_messages) == 1
+        assert '"behavior": "allow"' in transport.written_messages[0]
+
+    @pytest.mark.anyio
+    async def test_hook_callback_receives_abort_signal(self):
+        received: list[HookContext] = []
+
+        async def capture_hook(
+            input_data: HookInput, tool_use_id: str | None, context: HookContext
+        ) -> HookJSONOutput:
+            received.append(context)
+            return {}
+
+        transport = MockTransport()
+        query = Query(
+            transport=transport, is_streaming_mode=True, can_use_tool=None, hooks={}
+        )
+        query.hook_callbacks["hook_signal"] = capture_hook
+
+        await query._handle_control_request(
+            {
+                "type": "control_request",
+                "request_id": "test-hook-signal",
+                "request": {
+                    "subtype": "hook_callback",
+                    "callback_id": "hook_signal",
+                    "input": {"hook_event_name": "PreToolUse", "tool_name": "Bash"},
+                    "tool_use_id": "toolu_1",
+                },
+            }
+        )
+
+        assert len(received) == 1
+        signal = received[0]["signal"]
+        assert isinstance(signal, AbortSignal)
+        assert signal.aborted is False
+        assert signal.reason is None
+        response = json.loads(transport.written_messages[-1])
+        assert response["response"]["subtype"] == "success"
+
+    @pytest.mark.anyio
+    async def test_each_request_gets_its_own_signal(self):
+        signals: list[Any] = []
+
+        async def capture(
+            tool_name: str, input_data: dict, context: ToolPermissionContext
+        ) -> PermissionResultAllow:
+            signals.append(context.signal)
+            return PermissionResultAllow()
+
+        transport = MockTransport()
+        query = Query(
+            transport=transport,
+            is_streaming_mode=True,
+            can_use_tool=capture,
+            hooks=None,
+        )
+
+        for request_id in ("test-a", "test-b"):
+            await query._handle_control_request(self._permission_request(request_id))
+
+        assert len(signals) == 2
+        assert all(isinstance(s, AbortSignal) for s in signals)
+        assert signals[0] is not signals[1]
+        assert not any(s.aborted for s in signals)
 
 
 class TestClaudeAgentOptionsIntegration:

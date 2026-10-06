@@ -60,7 +60,8 @@ async def with_tools_example():
             for block in message.content:
                 if isinstance(block, TextBlock):
                     print(f"Claude: {block.text}")
-        elif isinstance(message, ResultMessage) and message.total_cost_usd > 0:
+        elif isinstance(message, ResultMessage) and message.total_cost_usd:
+            # total_cost_usd is None when the CLI reports no cost.
             print(f"\nCost: ${message.total_cost_usd:.4f}")
     print()
 

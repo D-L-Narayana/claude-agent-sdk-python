@@ -5,7 +5,7 @@ import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias
+from typing import Any, Final, Literal, Protocol, TypeAlias
 
 if sys.version_info >= (3, 11):
     from typing import NotRequired, Required, TypedDict
@@ -14,12 +14,6 @@ else:
     # so __required_keys__ would be wrong. typing_extensions backports the
     # correct behavior.
     from typing_extensions import NotRequired, Required, TypedDict
-
-if TYPE_CHECKING:
-    from mcp.server import Server as McpServer
-else:
-    # Runtime placeholder for forward reference resolution in Pydantic 2.12+
-    McpServer = Any
 
 # Permission modes
 PermissionMode = Literal[
@@ -223,7 +217,13 @@ class PermissionUpdate:
 class ToolPermissionContext:
     """Context information for tool permission callbacks."""
 
-    signal: Any | None = None  # Future: abort signal support
+    signal: Any | None = None
+    """Cooperative cancellation signal for this permission request.
+
+    A ``claude_agent_sdk.AbortSignal`` that is aborted when Claude Code
+    cancels the request (for example on interrupt) or when the query closes,
+    so a long-running callback can stop early instead of answering a request
+    nobody is waiting for. ``None`` when the SDK did not attach a signal."""
     suggestions: list[PermissionUpdate] = field(
         default_factory=list
     )  # Permission suggestions from CLI
@@ -585,17 +585,21 @@ class HookContext(TypedDict):
     """Context information for hook callbacks.
 
     Attributes:
-        signal: Reserved for future abort signal support. Currently always None.
+        signal: Cooperative cancellation signal for this hook invocation — a
+            ``claude_agent_sdk.AbortSignal`` that is aborted when Claude Code
+            cancels the request or when the query closes, so a long-running
+            hook can stop early. ``None`` when the SDK did not attach a
+            signal.
     """
 
-    signal: Any | None  # Future: abort signal support
+    signal: Any | None
 
 
 HookCallback = Callable[
     # HookCallback input parameters:
     # - input: Strongly-typed hook input with discriminated unions based on hook_event_name
     # - tool_use_id: Optional tool use identifier
-    # - context: Hook context with abort signal support (currently placeholder)
+    # - context: Hook context carrying the cooperative abort signal (see HookContext)
     [HookInput, str | None, HookContext],
     Awaitable[HookJSONOutput],
 ]
@@ -649,18 +653,23 @@ class McpSdkServerConfig(TypedDict):
     """SDK (in-process) MCP server configuration.
 
     Usually produced by ``create_sdk_mcp_server()``. ``instance`` may also be
-    any ``mcp.server.Server`` you have built yourself; the SDK serves it to
-    Claude Code over an in-memory MCP transport (one ``Server.run`` per
-    query, so its lifespan runs once), and the requests it handles (tools,
-    resources, prompts, ...) all reach it. Requests and notifications the
-    server sends to the client (sampling, elicitation, roots, logging,
-    progress) are not forwarded yet, and on mcp 1.x its tools are not
-    cancelled when Claude Code abandons a call: they run to completion.
+    any ``mcp.server.Server`` you have built yourself, or a ``FastMCP``
+    (mcp 1.x) / ``MCPServer`` (mcp 2.x) instance, whose lowlevel server is
+    served; the SDK serves it to Claude Code over an in-memory MCP transport
+    (one ``Server.run`` per query, so its lifespan runs once), and the
+    requests it handles (tools, resources, prompts, ...) all reach it.
+    Requests the server sends to the client (sampling, elicitation, roots)
+    are refused; log messages are forwarded to the
+    ``claude_agent_sdk.mcp.<name>`` logger and progress is logged there at
+    DEBUG. On mcp 1.x its tools are not cancelled when Claude Code abandons
+    a call: they run to completion.
     """
 
     type: Literal["sdk"]
     name: str
-    instance: "McpServer"
+    # mcp.server.Server, FastMCP (mcp 1.x) or MCPServer (mcp 2.x); validated
+    # by the SDK before the CLI starts
+    instance: Any
 
 
 McpServerConfig = (
@@ -960,10 +969,26 @@ class TextBlock:
 
 @dataclass
 class ThinkingBlock:
-    """Thinking content block."""
+    """Thinking content block.
+
+    ``signature`` is the API's opaque verification token for the thinking
+    text. It is optional on the wire (summarized or omitted thinking can
+    arrive without one), in which case it is the empty string.
+    """
 
     thinking: str
-    signature: str
+    signature: str = ""
+
+
+@dataclass
+class RedactedThinkingBlock:
+    """Thinking content the API withheld and returned encrypted.
+
+    ``data`` is an opaque blob: it carries no readable text, but it must be
+    preserved verbatim if the content is ever sent back to the API.
+    """
+
+    data: str
 
 
 @dataclass
@@ -1015,22 +1040,47 @@ class ServerToolUseBlock:
 class ServerToolResultBlock:
     """Result block returned for a server-side tool call.
 
-    Mirrors `ToolResultBlock`'s shape. `content` is the raw dict from the
-    API, opaque to this layer — callers that care about a specific server
-    tool's result schema can inspect `content["type"]`.
+    Produced for every content block whose ``type`` ends in ``_tool_result``
+    (``advisor_tool_result``, ``web_search_tool_result``,
+    ``web_fetch_tool_result``, ``code_execution_tool_result``,
+    ``bash_code_execution_tool_result``,
+    ``text_editor_code_execution_tool_result``, ``tool_search_tool_result``
+    and any server tool added later). Mirrors `ToolResultBlock`'s shape.
+
+    ``content`` is passed through from the API, opaque to this layer: a dict
+    for single-object results (inspect ``content["type"]``), a list for
+    multi-item results such as web search hits. When the block carries no
+    ``content`` object, ``content`` holds the remaining block fields
+    (everything except ``type`` and ``tool_use_id``) so nothing is lost.
     """
 
     tool_use_id: str
-    content: dict[str, Any]
+    content: dict[str, Any] | list[Any]
+
+
+@dataclass
+class UnknownBlock:
+    """A content block type this SDK version does not model.
+
+    Emitted instead of dropping the block, so block types introduced by newer
+    CLI or API versions (``image``, ``document``, future server tools, ...)
+    stay visible to callers. ``type`` is the wire discriminator and ``data``
+    the complete raw block.
+    """
+
+    type: str
+    data: dict[str, Any]
 
 
 ContentBlock = (
     TextBlock
     | ThinkingBlock
+    | RedactedThinkingBlock
     | ToolUseBlock
     | ToolResultBlock
     | ServerToolUseBlock
     | ServerToolResultBlock
+    | UnknownBlock
 )
 
 
@@ -1152,7 +1202,14 @@ class AssistantMessage:
 
 @dataclass
 class SystemMessage:
-    """System message with metadata."""
+    """System message with metadata.
+
+    ``data`` is the complete raw frame. Well-known subtypes parse into typed
+    subclasses (:class:`InitMessage`, :class:`CompactBoundaryMessage`,
+    :class:`StatusMessage`, the task lifecycle messages,
+    :class:`HookEventMessage`, :class:`MirrorErrorMessage`); any other
+    subtype yields this base class unchanged.
+    """
 
     subtype: str
     data: dict[str, Any]
@@ -1295,6 +1352,105 @@ class MirrorErrorMessage(SystemMessage):
 
     key: "SessionKey | None" = None
     error: str = ""
+
+
+@dataclass
+class InitMessage(SystemMessage):
+    """First message of a session (``system`` / ``init``).
+
+    Describes the session the CLI started: its id, model and working
+    directory, the tools, MCP servers, slash commands, agents, skills and
+    plugins available to it, and the effective permission mode. Every field
+    is optional on the wire and parsed defensively, so an older or minimal
+    CLI never makes this message fail to parse; the complete raw frame is
+    always available in ``data``.
+
+    Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
+    ``case SystemMessage()`` checks continue to match. ``subtype`` is
+    ``"init"``.
+
+    Attributes:
+        session_id: Session id the CLI assigned (or was asked to use).
+        model: Model the session runs on.
+        cwd: Working directory of the session.
+        tools: Names of the tools available to the model.
+        mcp_servers: One ``{"name": ..., "status": ...}`` entry per
+            configured MCP server.
+        permission_mode: Effective permission mode (wire key
+            ``permissionMode``; ``permission_mode`` is accepted too).
+        api_key_source: Where the API key came from, e.g. ``"user"``,
+            ``"project"``, ``"none"`` (wire key ``apiKeySource``;
+            ``api_key_source`` is accepted too).
+        slash_commands: Slash commands available in the session.
+        agents: Available agents: names (str) on current CLIs, descriptor
+            dicts on some versions; passed through as sent.
+        skills: Skills available in the session.
+        plugins: One ``{"name": ..., "path": ...}`` entry per loaded plugin.
+        output_style: Active output style.
+        claude_code_version: Version of the Claude Code CLI serving the
+            session.
+        betas: Beta features enabled for the session.
+        uuid: Unique id of this message.
+    """
+
+    session_id: str | None = None
+    model: str | None = None
+    cwd: str | None = None
+    tools: list[str] = field(default_factory=list)
+    mcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    permission_mode: str | None = None
+    api_key_source: str | None = None
+    slash_commands: list[str] = field(default_factory=list)
+    agents: list[Any] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    plugins: list[dict[str, Any]] = field(default_factory=list)
+    output_style: str | None = None
+    claude_code_version: str | None = None
+    betas: list[str] = field(default_factory=list)
+    uuid: str | None = None
+
+
+@dataclass
+class CompactBoundaryMessage(SystemMessage):
+    """Marks where the CLI compacted the conversation (``system`` /
+    ``compact_boundary``).
+
+    Everything before this message has been summarized; context size and
+    per-conversation counters restart after it. ``trigger`` says whether
+    compaction was ``"manual"`` (``/compact``) or ``"auto"`` and
+    ``pre_tokens`` is the context size just before it. Both are read from
+    ``data["compact_metadata"]`` and are ``None`` when the CLI did not
+    report them.
+
+    Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
+    ``case SystemMessage()`` checks continue to match. ``subtype`` is
+    ``"compact_boundary"``.
+    """
+
+    trigger: str | None = None
+    pre_tokens: int | None = None
+    session_id: str | None = None
+    uuid: str | None = None
+
+
+@dataclass
+class StatusMessage(SystemMessage):
+    """Transient session status (``system`` / ``status``).
+
+    ``status`` is ``"compacting"`` while the CLI compacts the conversation and
+    ``None`` once that finishes. CLI versions that announce permission-mode
+    changes through this message set ``permission_mode`` (wire key
+    ``permissionMode``; ``permission_mode`` is accepted too).
+
+    Subclass of SystemMessage: existing ``isinstance(msg, SystemMessage)`` and
+    ``case SystemMessage()`` checks continue to match. ``subtype`` is
+    ``"status"``.
+    """
+
+    status: str | None = None
+    permission_mode: str | None = None
+    session_id: str | None = None
+    uuid: str | None = None
 
 
 @dataclass
@@ -1496,6 +1652,74 @@ class HookEventMessage(SystemMessage):
     uuid: str | None = None
 
 
+@dataclass
+class ToolProgressMessage:
+    """Heartbeat emitted while a tool call is running (``type`` ==
+    ``"tool_progress"``).
+
+    The CLI emits these periodically for long-running tool executions so a
+    UI can show that work is still happening and for how long.
+    ``tool_use_id`` identifies the running ``tool_use`` block;
+    ``parent_tool_use_id`` is the spawning Agent call when the tool runs
+    inside a subagent. The raw frame is kept in ``data``.
+
+    Attributes:
+        tool_use_id: Id of the ``tool_use`` block being executed.
+        tool_name: Name of the tool being executed.
+        elapsed_time_seconds: Seconds elapsed since the tool call started.
+        parent_tool_use_id: Id of the parent Agent ``tool_use`` when running
+            inside a subagent, else ``None``.
+        uuid: Unique id of this message, if present.
+        session_id: Session the message belongs to, if present.
+        data: Complete raw frame.
+    """
+
+    tool_use_id: str
+    tool_name: str
+    elapsed_time_seconds: float
+    parent_tool_use_id: str | None = None
+    uuid: str | None = None
+    session_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ToolUseSummaryMessage:
+    """Short description of a group of tool calls (``type`` ==
+    ``"tool_use_summary"``).
+
+    The CLI generates these summaries for display after the model issued
+    tool calls; ``preceding_tool_use_ids`` lists the ``tool_use`` ids the
+    summary covers. The raw frame is kept in ``data``.
+    """
+
+    summary: str
+    preceding_tool_use_ids: list[str] = field(default_factory=list)
+    uuid: str | None = None
+    session_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AuthStatusMessage:
+    """Authentication flow progress (``type`` == ``"auth_status"``).
+
+    Emitted while the CLI is (re)authenticating, for example when a login is
+    required before the first turn can run. ``is_authenticating`` (wire key
+    ``isAuthenticating``; ``is_authenticating`` is accepted too) is ``True``
+    while the flow is in progress, ``output`` carries the lines the flow has
+    printed so far and ``error`` the failure message when authentication
+    failed. The raw frame is kept in ``data``.
+    """
+
+    is_authenticating: bool
+    output: list[str] = field(default_factory=list)
+    error: str | None = None
+    uuid: str | None = None
+    session_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
 Message = (
     UserMessage
     | AssistantMessage
@@ -1504,6 +1728,9 @@ Message = (
     | StreamEvent
     | RateLimitEvent
     | ConversationResetMessage
+    | ToolProgressMessage
+    | ToolUseSummaryMessage
+    | AuthStatusMessage
 )
 
 

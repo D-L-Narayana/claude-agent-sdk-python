@@ -39,6 +39,9 @@ dev = [
     "pytest-cov>=4.0.0",
     "mypy>=1.0.0",
     "ruff>=0.1.0",
+    # tests/test_workflow_gates.py parses .github/workflows/test.yml with a
+    # real YAML parser to check the Claude-API job gates.
+    "pyyaml>=6.0",
 ]
 otel = [
     "opentelemetry-api>=1.20.0",
@@ -56,7 +59,7 @@ examples = [
 
 [project.urls]
 Homepage = "https://github.com/anthropics/claude-agent-sdk-python"
-Documentation = "https://docs.anthropic.com/en/docs/claude-code/sdk"
+Documentation = "https://platform.claude.com/docs/en/agent-sdk/python"
 Issues = "https://github.com/anthropics/claude-agent-sdk-python/issues"
 
 [tool.hatch.build.targets.wheel]
@@ -72,6 +75,12 @@ include = [
     # /tests without /scripts cannot even collect its own test suite.
     "/scripts",
     "/examples",
+    # tests/test_workflow_gates.py parses this workflow to check the
+    # Claude-API job gates, so the shipped test suite needs the file too.
+    "/.github/workflows/test.yml",
+    # tests/test_changelog.py checks the changelog's format from the shipped
+    # suite as well.
+    "/CHANGELOG.md",
     "/README.md",
     "/LICENSE",
 ]
@@ -127,6 +136,9 @@ ignore_missing_imports = true
 [tool.ruff]
 target-version = "py310"
 line-length = 88
+# A copy-paste IPython snippet file with top-level `await`; it is not an
+# importable module and cannot be linted or formatted as one.
+extend-exclude = ["examples/streaming_mode_ipython.py"]
 
 [tool.ruff.lint]
 select = [

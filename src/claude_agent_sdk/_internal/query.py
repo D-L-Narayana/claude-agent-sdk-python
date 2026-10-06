@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 
-from .._errors import ProcessError, ResultError, _normalize_result_errors
+from .._errors import (
+    ControlRequestError,
+    ControlRequestTimeoutError,
+    ProcessError,
+    ResultError,
+    _normalize_result_errors,
+)
 from ..types import (
     TERMINAL_TASK_STATUSES,
     PermissionMode,
@@ -24,6 +30,7 @@ from ..types import (
     ToolPermissionContext,
 )
 from ._task_compat import TaskHandle, spawn_detached
+from .abort_signal import AbortSignal
 from .sdk_mcp_bridge import SdkMcpBridge
 from .transport import Transport
 
@@ -108,6 +115,17 @@ def _error_result_text(message: dict[str, Any]) -> str:
     if status is not None:
         return f"API error (HTTP {status})"
     return "unknown error"
+
+
+def _control_error_text(response: dict[str, Any]) -> str:
+    """The CLI's error text from an ``error`` control response.
+
+    Falls back to ``"Unknown error"`` when the response carries no text.
+    """
+    error = response.get("error")
+    if error is None or error == "":
+        return "Unknown error"
+    return error if isinstance(error, str) else str(error)
 
 
 def _convert_hook_output_for_cli(hook_output: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +239,10 @@ class Query:
         # Control protocol state
         self.pending_control_responses: dict[str, anyio.Event] = {}
         self.pending_control_results: dict[str, dict[str, Any] | Exception] = {}
+        # Subtype of each pending outbound request, so an error response
+        # (which carries only the request_id) can be typed with the request
+        # it answers. Cleaned up together with the two maps above.
+        self._pending_control_subtypes: dict[str, str | None] = {}
         self.hook_callbacks: dict[str, Callable[..., Any]] = {}
         self.next_callback_id = 0
         self._request_counter = 0
@@ -232,6 +254,10 @@ class Query:
         self._read_task: TaskHandle | None = None
         self._child_tasks: set[TaskHandle] = set()
         self._inflight_requests: dict[str, TaskHandle] = {}
+        # One AbortSignal per inbound control request being handled, keyed
+        # like _inflight_requests; aborted on control_cancel_request and on
+        # close() so hook/permission callbacks can stop early.
+        self._inflight_signals: dict[str, AbortSignal] = {}
         self._initialized = False
         self._closed = False
         self._initialization_result: dict[str, Any] | None = None
@@ -382,6 +408,9 @@ class Query:
 
         def _done(_t: TaskHandle) -> None:
             self._inflight_requests.pop(req_id, None)
+            # The handler drops its own signal in its finally; this covers a
+            # task cancelled before its body ever ran.
+            self._inflight_signals.pop(req_id, None)
 
         task.add_done_callback(_done)
 
@@ -401,8 +430,16 @@ class Query:
                     if request_id in self.pending_control_responses:
                         event = self.pending_control_responses[request_id]
                         if response.get("subtype") == "error":
-                            self.pending_control_results[request_id] = Exception(
-                                response.get("error", "Unknown error")
+                            # Typed with the *request's* subtype: the error
+                            # response itself only names the request_id.
+                            self.pending_control_results[request_id] = (
+                                ControlRequestError(
+                                    _control_error_text(response),
+                                    subtype=self._pending_control_subtypes.get(
+                                        request_id
+                                    ),
+                                    request_id=request_id,
+                                )
                             )
                         else:
                             self.pending_control_results[request_id] = response
@@ -421,6 +458,12 @@ class Query:
                     cancel_id = message.get("request_id")
                     if cancel_id:
                         inflight = self._inflight_requests.pop(cancel_id, None)
+                        # Abort the signal first, so a callback that wakes
+                        # from signal.wait() — or is cancelled right after —
+                        # already sees the reason.
+                        signal = self._inflight_signals.get(cancel_id)
+                        if signal is not None:
+                            signal._abort("cancelled by Claude Code")
                         if inflight:
                             inflight.cancel()
                     continue
@@ -575,10 +618,28 @@ class Query:
             self._message_send.close()
 
     async def _handle_control_request(self, request: SDKControlRequest) -> None:
-        """Handle incoming control request from CLI."""
+        """Handle incoming control request from CLI.
+
+        Every request gets its own :class:`AbortSignal`, handed to the
+        ``can_use_tool`` callback as ``ToolPermissionContext.signal`` and to
+        hook callbacks as ``context["signal"]``. It is aborted when the CLI
+        abandons the request (``control_cancel_request``) or the query
+        closes, and dropped from ``_inflight_signals`` once the handler is
+        done.
+
+        Failures are reported back to the CLI as an ``error`` control
+        response whose text names the exception type
+        (``"ValueError: ..."``); the SDK's own refusals (no callback
+        registered, unknown subtype, malformed MCP request) are
+        :class:`ControlRequestError` instances. Cancellation writes nothing:
+        the CLI has already moved on.
+        """
         request_id = request["request_id"]
         request_data = request["request"]
         subtype = request_data["subtype"]
+
+        signal = AbortSignal()
+        self._inflight_signals[request_id] = signal
 
         try:
             response_data: dict[str, Any] = {}
@@ -588,10 +649,14 @@ class Query:
                 original_input = permission_request["input"]
                 # Handle tool permission request
                 if not self.can_use_tool:
-                    raise Exception("canUseTool callback is not provided")
+                    raise ControlRequestError(
+                        "canUseTool callback is not provided",
+                        subtype=subtype,
+                        request_id=request_id,
+                    )
 
                 context = ToolPermissionContext(
-                    signal=None,  # TODO: Add abort signal support
+                    signal=signal,
                     suggestions=[
                         PermissionUpdate.from_dict(s)
                         for s in (
@@ -643,12 +708,16 @@ class Query:
                 callback_id = hook_callback_request["callback_id"]
                 callback = self.hook_callbacks.get(callback_id)
                 if not callback:
-                    raise Exception(f"No hook callback found for ID: {callback_id}")
+                    raise ControlRequestError(
+                        f"No hook callback found for ID: {callback_id}",
+                        subtype=subtype,
+                        request_id=request_id,
+                    )
 
                 hook_output = await callback(
                     request_data.get("input"),
                     request_data.get("tool_use_id"),
-                    {"signal": None},  # TODO: Add abort signal support
+                    {"signal": signal},
                 )
                 # Convert Python-safe field names (async_, continue_) to CLI-expected names (async, continue)
                 response_data = _convert_hook_output_for_cli(hook_output)
@@ -659,7 +728,11 @@ class Query:
                 mcp_message = request_data.get("message")
 
                 if not server_name or not mcp_message:
-                    raise Exception("Missing server_name or message for MCP request")
+                    raise ControlRequestError(
+                        "Missing server_name or message for MCP request",
+                        subtype=subtype,
+                        request_id=request_id,
+                    )
 
                 # Type narrowing - we've verified these are not None above
                 assert isinstance(server_name, str)
@@ -674,7 +747,11 @@ class Query:
                 response_data = {"mcp_response": mcp_response}
 
             else:
-                raise Exception(f"Unsupported control request subtype: {subtype}")
+                raise ControlRequestError(
+                    f"Unsupported control request subtype: {subtype}",
+                    subtype=subtype,
+                    request_id=request_id,
+                )
 
             # Send success response
             success_response: SDKControlResponse = {
@@ -692,16 +769,20 @@ class Query:
             # already abandoned this request, so don't write a response.
             raise
         except Exception as e:
-            # Send error response
+            # Send error response. The type name makes a Python failure
+            # legible on the CLI side ("ValueError: ..." rather than prose).
             error_response: SDKControlResponse = {
                 "type": "control_response",
                 "response": {
                     "subtype": "error",
                     "request_id": request_id,
-                    "error": str(e),
+                    "error": f"{type(e).__name__}: {e}",
                 },
             }
             await self.transport.write(json.dumps(error_response) + "\n")
+        finally:
+            if self._inflight_signals.get(request_id) is signal:
+                del self._inflight_signals[request_id]
 
     async def _send_control_request(
         self, request: dict[str, Any], timeout: float = 60.0
@@ -711,9 +792,22 @@ class Query:
         Args:
             request: The control request to send
             timeout: Timeout in seconds to wait for response (default 60s)
+
+        Raises:
+            ControlRequestTimeoutError: No response arrived within ``timeout``.
+            ControlRequestError: The CLI answered with an error response (the
+                message is the CLI's text), or the query is not in streaming
+                mode.
+            ProcessError: The reader failed while the request was pending
+                (the CLI exited); ``_read_messages`` fails pending requests
+                with the exception it saw (a ``ResultError`` when the CLI
+                reported an error result first).
         """
+        subtype = request.get("subtype")
         if not self.is_streaming_mode:
-            raise Exception("Control requests require streaming mode")
+            raise ControlRequestError(
+                "Control requests require streaming mode", subtype=subtype
+            )
 
         # Generate unique request ID
         self._request_counter += 1
@@ -722,6 +816,7 @@ class Query:
         # Create event for response
         event = anyio.Event()
         self.pending_control_responses[request_id] = event
+        self._pending_control_subtypes[request_id] = subtype
 
         # Build and send request
         control_request = {
@@ -730,25 +825,35 @@ class Query:
             "request": request,
         }
 
-        await self.transport.write(json.dumps(control_request) + "\n")
-
-        # Wait for response
         try:
-            with anyio.fail_after(timeout):
-                await event.wait()
+            await self.transport.write(json.dumps(control_request) + "\n")
+
+            # Wait for response
+            try:
+                with anyio.fail_after(timeout):
+                    await event.wait()
+            except TimeoutError as e:
+                raise ControlRequestTimeoutError(
+                    f"Control request timeout: {subtype}",
+                    timeout=timeout,
+                    subtype=subtype,
+                    request_id=request_id,
+                ) from e
 
             result = self.pending_control_results.pop(request_id)
-            self.pending_control_responses.pop(request_id, None)
 
             if isinstance(result, Exception):
                 raise result
 
             response_data = result.get("response", {})
             return response_data if isinstance(response_data, dict) else {}
-        except TimeoutError as e:
+        finally:
+            # Also reached when the write fails or the waiter is cancelled, so
+            # a response that arrives afterwards finds nothing to wake and is
+            # dropped rather than parked in the maps forever.
             self.pending_control_responses.pop(request_id, None)
             self.pending_control_results.pop(request_id, None)
-            raise Exception(f"Control request timeout: {request.get('subtype')}") from e
+            self._pending_control_subtypes.pop(request_id, None)
 
     async def _handle_sdk_mcp_request(
         self, server_name: str, message: dict[str, Any]
@@ -1183,6 +1288,12 @@ class Query:
 
     async def _close_impl(self) -> None:
         self._closed = True
+        # Tell every callback still answering a CLI request that nobody is
+        # waiting for its answer any more, before its task is cancelled below
+        # (so it can read the reason) and before the mirror flush (which may
+        # take a while) so it can stop early.
+        for signal in list(self._inflight_signals.values()):
+            signal._abort("query closed")
         # Final-flush mirror entries before tearing down so .return()/break
         # don't drop the current turn when the process exits immediately.
         if self._transcript_mirror_batcher is not None:

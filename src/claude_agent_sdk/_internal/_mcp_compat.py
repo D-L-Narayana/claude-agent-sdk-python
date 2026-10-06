@@ -12,13 +12,17 @@ genuinely differ live here:
 - registering ``tools/list`` / ``tools/call`` handlers on a lowlevel
   ``Server`` (decorators on 1.x, constructor callbacks on 2.x), and
 - whether a served ``Server`` can take a client's cancellation (any server
-  on 2.x; on 1.x only the ones built here, see ``can_cancel_requests``).
+  on 2.x; on 1.x only the ones built here, see ``can_cancel_requests``), and
+- where the high-level server class lives (``mcp.server.fastmcp.FastMCP`` on
+  1.x, ``mcp.server.mcpserver.MCPServer`` on 2.x) and under which attribute
+  it keeps the lowlevel ``Server`` the SDK actually serves.
 
 Nothing outside this module may branch on the mcp version.
 """
 
 from __future__ import annotations
 
+import importlib
 import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -51,6 +55,43 @@ _Server: Any = Server
 _REQUEST_CANCELLED = {"code": -32800, "message": "Request cancelled"}
 
 Respond = Callable[[dict[str, Any]], None]
+
+# Where the high-level server class keeps the lowlevel ``Server`` it wraps:
+# FastMCP (1.x) as ``_mcp_server``, MCPServer (2.x) as ``_lowlevel_server``.
+# Both names are probed whichever major is installed, so an object shaped
+# like either release's class is accepted.
+LOWLEVEL_SERVER_ATTRIBUTES: tuple[str, ...] = ("_mcp_server", "_lowlevel_server")
+
+
+def highlevel_server_class() -> type[Any]:
+    """The installed major's high-level server class.
+
+    ``mcp.server.mcpserver.MCPServer`` on 2.x, ``mcp.server.fastmcp.FastMCP``
+    on 1.x. Imported lazily, by name, because only one of the two modules
+    exists in any given environment.
+    """
+    if MCP_MAJOR >= 2:
+        module_name, class_name = "mcp.server.mcpserver", "MCPServer"
+    else:
+        module_name, class_name = "mcp.server.fastmcp", "FastMCP"
+    cls: type[Any] = getattr(importlib.import_module(module_name), class_name)
+    return cls
+
+
+def highlevel_tool_error_class() -> type[Exception]:
+    """The installed major's ``ToolError`` for high-level server tools.
+
+    Raising it from a tool reports the failure to the client with the
+    message as given; on 2.x any other exception is reported with its text
+    masked ("Error executing tool <name>"). ``mcp.server.mcpserver.exceptions``
+    on 2.x, ``mcp.server.fastmcp.exceptions`` on 1.x.
+    """
+    if MCP_MAJOR >= 2:
+        module_name = "mcp.server.mcpserver.exceptions"
+    else:
+        module_name = "mcp.server.fastmcp.exceptions"
+    cls: type[Exception] = importlib.import_module(module_name).ToolError
+    return cls
 
 
 def parse_jsonrpc(

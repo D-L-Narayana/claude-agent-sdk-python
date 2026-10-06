@@ -15,7 +15,6 @@ on:
       - '.github/workflows/build-and-publish.yml'
       - '.github/workflows/build-wheel-check.yml'
       - 'pyproject.toml'
-      - 'MANIFEST.in'
 
 jobs:
   build:

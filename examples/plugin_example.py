@@ -54,7 +54,9 @@ async def plugin_example():
                     print(f"  - {plugin.get('name')} (path: {plugin.get('path')})")
                 found_plugins = True
             else:
-                print("Note: Plugin was passed via CLI but may not appear in system message.")
+                print(
+                    "Note: Plugin was passed via CLI but may not appear in system message."
+                )
                 print(f"Plugin path configured: {plugin_path}")
                 found_plugins = True
 

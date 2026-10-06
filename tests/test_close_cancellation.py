@@ -26,9 +26,18 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     _ACTIVE_CHILDREN,
     SubprocessCLITransport,
+    clear_cli_version_cache,
 )
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_version_cache() -> None:
+    """The `claude -v` probe result is cached per binary for the life of the
+    process; start every test from an empty cache."""
+    clear_cli_version_cache()
+
 
 # Only the tests that spawn the shebang-based fake CLI or read process state via
 # `ps` are POSIX-only. The pure-mock bookkeeping test runs everywhere.

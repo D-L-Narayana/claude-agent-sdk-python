@@ -25,13 +25,9 @@ async def main():
 
     # Run a query
     print("Running query with stderr capture...")
-    async for message in query(
-        prompt="What is 2+2?",
-        options=options
-    ):
-        if hasattr(message, 'content'):
-            if isinstance(message.content, str):
-                print(f"Response: {message.content}")
+    async for message in query(prompt="What is 2+2?", options=options):
+        if hasattr(message, "content") and isinstance(message.content, str):
+            print(f"Response: {message.content}")
 
     # Show what we captured
     print(f"\nCaptured {len(stderr_messages)} stderr lines")

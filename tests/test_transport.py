@@ -9,11 +9,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import anyio
 import pytest
 
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+from claude_agent_sdk._internal.transport.subprocess_cli import (
+    SubprocessCLITransport,
+    clear_cli_version_cache,
+)
 from claude_agent_sdk.types import ClaudeAgentOptions
 
 DEFAULT_CLI_PATH = "/usr/bin/claude"
 _ABSENT = object()  # sentinel for "field not sent on the wire"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cli_version_cache() -> None:
+    """The `claude -v` probe result is cached per binary for the life of the
+    process; the mocks here answer with different versions for the same path,
+    so every test starts from an empty cache."""
+    clear_cli_version_cache()
 
 
 def make_options(**kwargs: object) -> ClaudeAgentOptions:

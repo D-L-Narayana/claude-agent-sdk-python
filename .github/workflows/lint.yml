@@ -25,8 +25,8 @@ jobs:
     
     - name: Run ruff
       run: |
-        ruff check src/ tests/ scripts/
-        ruff format --check src/ tests/ scripts/
+        ruff check src/ tests/ scripts/ examples/
+        ruff format --check src/ tests/ scripts/ examples/
     
     - name: Run mypy
       run: |

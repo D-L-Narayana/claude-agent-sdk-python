@@ -45,7 +45,11 @@ async def code_reviewer_example():
             for block in message.content:
                 if isinstance(block, TextBlock):
                     print(f"Claude: {block.text}")
-        elif isinstance(message, ResultMessage) and message.total_cost_usd and message.total_cost_usd > 0:
+        elif (
+            isinstance(message, ResultMessage)
+            and message.total_cost_usd
+            and message.total_cost_usd > 0
+        ):
             print(f"\nCost: ${message.total_cost_usd:.4f}")
     print()
 
@@ -74,7 +78,11 @@ async def documentation_writer_example():
             for block in message.content:
                 if isinstance(block, TextBlock):
                     print(f"Claude: {block.text}")
-        elif isinstance(message, ResultMessage) and message.total_cost_usd and message.total_cost_usd > 0:
+        elif (
+            isinstance(message, ResultMessage)
+            and message.total_cost_usd
+            and message.total_cost_usd > 0
+        ):
             print(f"\nCost: ${message.total_cost_usd:.4f}")
     print()
 
@@ -108,7 +116,11 @@ async def multiple_agents_example():
             for block in message.content:
                 if isinstance(block, TextBlock):
                     print(f"Claude: {block.text}")
-        elif isinstance(message, ResultMessage) and message.total_cost_usd and message.total_cost_usd > 0:
+        elif (
+            isinstance(message, ResultMessage)
+            and message.total_cost_usd
+            and message.total_cost_usd > 0
+        ):
             print(f"\nCost: ${message.total_cost_usd:.4f}")
     print()
 

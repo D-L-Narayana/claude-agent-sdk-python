@@ -162,8 +162,6 @@ async def example_project_and_user():
     print()
 
 
-
-
 async def main():
     """Run all examples or a specific example based on command line argument."""
     examples = {

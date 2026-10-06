@@ -136,6 +136,64 @@ class TestInMemorySessionStore:
 
 
 # ---------------------------------------------------------------------------
+# Harness lifecycle: stores that own resources are closed by the harness
+# ---------------------------------------------------------------------------
+
+
+class _ClosableStore(InMemorySessionStore):
+    """In-memory store with an awaitable ``aclose`` that records the call."""
+
+    def __init__(self, created: list[_ClosableStore]) -> None:
+        super().__init__()
+        self.closed = False
+        created.append(self)
+
+    async def aclose(self) -> None:
+        assert not self.closed, "aclose() must be awaited at most once per store"
+        self.closed = True
+
+
+class TestHarnessClosesStores:
+    @pytest.mark.anyio
+    async def test_awaits_aclose_on_every_store_it_creates(self) -> None:
+        created: list[_ClosableStore] = []
+        await run_session_store_conformance(lambda: _ClosableStore(created))
+        # One store per contract plus the capability probe.
+        assert len(created) > 1
+        assert all(store.closed for store in created)
+
+    @pytest.mark.anyio
+    async def test_closes_stores_even_when_a_contract_fails(self) -> None:
+        created: list[_ClosableStore] = []
+
+        class BrokenStore(_ClosableStore):
+            async def load(self, key: SessionKey) -> list | None:
+                return None  # violates contract 1 (append then load)
+
+        with pytest.raises(AssertionError):
+            await run_session_store_conformance(lambda: BrokenStore(created))
+        assert created and all(store.closed for store in created)
+
+    @pytest.mark.anyio
+    async def test_sync_aclose_is_called_but_not_awaited(self) -> None:
+        calls: list[str] = []
+
+        class SyncCloseStore(InMemorySessionStore):
+            def aclose(self) -> None:
+                calls.append("closed")
+
+        await run_session_store_conformance(SyncCloseStore)
+        assert calls and all(c == "closed" for c in calls)
+
+    @pytest.mark.anyio
+    async def test_stores_without_aclose_are_unaffected(self) -> None:
+        """InMemorySessionStore (like the S3/Redis/Postgres reference adapters)
+        has no ``aclose``; the aclose-aware harness must still pass it."""
+        assert not hasattr(InMemorySessionStore(), "aclose")
+        await run_session_store_conformance(InMemorySessionStore)
+
+
+# ---------------------------------------------------------------------------
 # Options validation
 # ---------------------------------------------------------------------------
 

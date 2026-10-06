@@ -152,6 +152,36 @@ class TestSdistShipsTheScriptsItsTestsImport:
         assert "/tests" in include
         assert "/scripts" in include
 
+    @pytest.mark.parametrize(
+        ("path", "reader"),
+        [
+            ("/examples", "tests/test_examples_static.py and the adapter tests"),
+            ("/CHANGELOG.md", "tests/test_changelog.py"),
+            ("/.github/workflows/test.yml", "tests/test_workflow_gates.py"),
+        ],
+    )
+    def test_every_file_the_shipped_tests_read_is_in_the_sdist(
+        self, path: str, reader: str
+    ) -> None:
+        """Files the shipped suite opens at *runtime*, beyond the import-time
+        scripts/ dependency above.
+
+        The include list is the mechanism this guards; the behavioral evidence
+        is running the whole suite from an extracted sdist, which errored at
+        load_workflow and failed every test_changelog case before these entries
+        existed. A regression here is caught by `pytest tests/` rather than at
+        the next sdist build.
+        """
+        tomllib = pytest.importorskip("tomllib")  # stdlib from 3.11
+
+        config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        include = config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+
+        assert path in include, f"{reader} reads {path} from the sdist"
+        # An include entry for a file that no longer exists ships nothing, and
+        # hatch does not complain: keep the entry and the file in step.
+        assert (REPO_ROOT / path.lstrip("/")).exists(), path
+
 
 def _make_wheel(path: Path) -> None:
     """Write a small stand-in wheel to path."""

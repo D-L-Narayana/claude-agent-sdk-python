@@ -1,9 +1,15 @@
-#!/usr/bin/env python3
 """
 IPython-friendly code snippets for ClaudeSDKClient streaming mode.
 
+NOT AN IMPORTABLE MODULE OR A RUNNABLE SCRIPT. Every section below uses
+top-level ``await``, which is only valid inside an IPython / Jupyter cell
+(or ``python -m asyncio``). ``python streaming_mode_ipython.py`` and
+``import streaming_mode_ipython`` both fail with a SyntaxError, and the file is
+excluded from the repository's lint and static example checks for the same
+reason. For a runnable version of these patterns see ``streaming_mode.py``.
+
 These examples are designed to be copy-pasted directly into IPython.
-Each example is self-contained and can be run independently.
+Each section is self-contained: paste it as its own cell and run it.
 
 The queries are intentionally simplistic. In reality, a query can be a more
 complex task that Claude SDK uses its agentic capabilities and tools (e.g. run
@@ -141,6 +147,8 @@ async with ClaudeSDKClient() as client:
 # ERROR HANDLING PATTERN
 # ============================================================================
 
+import anyio
+
 from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, TextBlock
 
 try:
@@ -148,9 +156,10 @@ try:
         print("User: Run a bash sleep command for 60 seconds")
         await client.query("Run a bash sleep command for 60 seconds")
 
-        # Timeout after 20 seconds
+        # Timeout after 20 seconds. anyio.fail_after raises TimeoutError and
+        # works on Python 3.10 (the SDK's minimum), unlike asyncio.timeout.
         messages = []
-        async with asyncio.timeout(20.0):
+        with anyio.fail_after(20.0):
             async for msg in client.receive_response():
                 messages.append(msg)
                 if isinstance(msg, AssistantMessage):
@@ -158,7 +167,7 @@ try:
                         if isinstance(block, TextBlock):
                             print(f"Claude: {block.text}")
 
-except asyncio.TimeoutError:
+except TimeoutError:
     print("Request timed out after 20 seconds")
 except Exception as e:
     print(f"Error: {e}")

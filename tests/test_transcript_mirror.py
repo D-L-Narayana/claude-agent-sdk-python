@@ -5,6 +5,7 @@ in the receive loop.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from claude_agent_sdk._internal.sessions import _get_projects_dir
 from claude_agent_sdk._internal.transcript_mirror_batcher import (
     MAX_PENDING_BYTES,
     MAX_PENDING_ENTRIES,
+    MirrorStats,
     TranscriptMirrorBatcher,
 )
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
@@ -519,6 +521,206 @@ class TestTranscriptMirrorBatcher:
             await anyio.sleep(0)
             gate.set()
         assert order == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# TranscriptMirrorBatcher.stats
+# ---------------------------------------------------------------------------
+
+
+def _stats_tuple(s: MirrorStats) -> tuple[int, int, int, int, int, int]:
+    return (
+        s.frames_enqueued,
+        s.entries_enqueued,
+        s.flushes,
+        s.entries_flushed,
+        s.batches_failed,
+        s.entries_dropped,
+    )
+
+
+class TestMirrorStats:
+    def test_initial_stats_are_all_zero(self) -> None:
+        batcher = TranscriptMirrorBatcher(
+            store=_RecordingStore(), projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        assert batcher.stats == MirrorStats()
+        assert _stats_tuple(batcher.stats) == (0, 0, 0, 0, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_enqueue_counts_frames_and_entries(self) -> None:
+        batcher = TranscriptMirrorBatcher(
+            store=_RecordingStore(), projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        batcher.enqueue(_main_path(), [{"type": "user", "n": 1}, {"type": "x", "n": 2}])
+        batcher.enqueue(_main_path(), [{"type": "assistant", "n": 3}])
+
+        # Nothing flushed yet: only the enqueue counters moved.
+        assert _stats_tuple(batcher.stats) == (2, 3, 0, 0, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_successful_flush_counts_flushes_and_entries_flushed(self) -> None:
+        store = _RecordingStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store, projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        batcher.enqueue(_main_path(), [{"type": "user", "n": 1}, {"type": "x", "n": 2}])
+        batcher.enqueue(_main_path(), [{"type": "assistant", "n": 3}])
+        await batcher.flush()
+
+        assert _stats_tuple(batcher.stats) == (2, 3, 1, 3, 0, 0)
+        assert len(store.append_calls) == 1
+
+        # A flush with nothing pending is not counted.
+        await batcher.flush()
+        assert batcher.stats.flushes == 1
+
+    @pytest.mark.anyio
+    async def test_coalesced_flush_sums_entries_across_keys(self) -> None:
+        store = _RecordingStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store, projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        batcher.enqueue(_main_path("p", "a"), [{"type": "x", "n": 1}])
+        batcher.enqueue(_main_path("p", "b"), [{"type": "x", "n": 2}])
+        batcher.enqueue(_main_path("p", "a"), [{"type": "x", "n": 3}])
+        await batcher.flush()
+
+        # One drain, two store.append() calls (one per key), three entries.
+        assert len(store.append_calls) == 2
+        assert _stats_tuple(batcher.stats) == (3, 3, 1, 3, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_eager_flush_is_counted(self) -> None:
+        store = _RecordingStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store,
+            projects_dir=PROJECTS_DIR,
+            on_error=_noop_error,
+            max_pending_entries=5,
+        )
+        batcher.enqueue(_main_path(), [{"type": "x"}] * 6)  # > 5 → eager flush
+        # entries_flushed is the last counter to move (after append returns).
+        await _wait_until(lambda: batcher.stats.entries_flushed == 6)
+
+        assert _stats_tuple(batcher.stats) == (1, 6, 1, 6, 0, 0)
+        assert len(store.append_calls) == 1
+
+    @pytest.mark.anyio
+    async def test_failing_store_counts_failed_batch_and_dropped_entries(
+        self,
+    ) -> None:
+        class AlwaysFailingStore(InMemorySessionStore):
+            async def append(self, key, entries):
+                raise RuntimeError("boom")
+
+        errors: list[tuple[SessionKey | None, str]] = []
+
+        async def on_error(key: SessionKey | None, err: str) -> None:
+            errors.append((key, err))
+
+        batcher = TranscriptMirrorBatcher(
+            store=AlwaysFailingStore(), projects_dir=PROJECTS_DIR, on_error=on_error
+        )
+        batcher.enqueue(_main_path(), [{"type": "x", "n": 1}, {"type": "x", "n": 2}])
+        with patch(_BATCHER_SLEEP, new=AsyncMock()):
+            await batcher.flush()
+
+        assert len(errors) == 1
+        assert _stats_tuple(batcher.stats) == (1, 2, 1, 0, 1, 2)
+
+    @pytest.mark.anyio
+    async def test_retry_then_success_counts_entries_flushed_once(self) -> None:
+        attempts: list[int] = []
+
+        class FlakyStore(InMemorySessionStore):
+            async def append(self, key, entries):
+                attempts.append(1)
+                if len(attempts) < 3:
+                    raise RuntimeError("transient")
+                await super().append(key, entries)
+
+        batcher = TranscriptMirrorBatcher(
+            store=FlakyStore(), projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        batcher.enqueue(_main_path(), [{"type": "x"}])
+        with patch(_BATCHER_SLEEP, new=AsyncMock()):
+            await batcher.flush()
+
+        assert len(attempts) == 3
+        # Counted on the successful attempt only; failed attempts that were
+        # retried are neither "failed batches" nor "dropped entries".
+        assert _stats_tuple(batcher.stats) == (1, 1, 1, 1, 0, 0)
+
+    @pytest.mark.anyio
+    async def test_timeout_drop_counts_failed_batch_and_dropped_entries(
+        self,
+    ) -> None:
+        class HangingStore(InMemorySessionStore):
+            async def append(self, key, entries):
+                await anyio.Event().wait()  # never resolves
+
+        errors: list[str] = []
+
+        async def on_error(_key: SessionKey | None, err: str) -> None:
+            errors.append(err)
+
+        batcher = TranscriptMirrorBatcher(
+            store=HangingStore(),
+            projects_dir=PROJECTS_DIR,
+            on_error=on_error,
+            send_timeout=0.05,
+        )
+        batcher.enqueue(_main_path(), [{"type": "x"}])
+        await batcher.flush()
+
+        assert len(errors) == 1
+        assert _stats_tuple(batcher.stats) == (1, 1, 1, 0, 1, 1)
+
+    @pytest.mark.anyio
+    async def test_partial_failure_across_keys_is_accounted_per_batch(self) -> None:
+        class FailsForBadSession(InMemorySessionStore):
+            async def append(self, key, entries):
+                if key["session_id"] == "bad":
+                    raise RuntimeError("boom")
+                await super().append(key, entries)
+
+        errors: list[tuple[SessionKey | None, str]] = []
+
+        async def on_error(key: SessionKey | None, err: str) -> None:
+            errors.append((key, err))
+
+        batcher = TranscriptMirrorBatcher(
+            store=FailsForBadSession(), projects_dir=PROJECTS_DIR, on_error=on_error
+        )
+        batcher.enqueue(_main_path("p", "good"), [{"type": "x"}, {"type": "x"}])
+        batcher.enqueue(_main_path("p", "bad"), [{"type": "x"}])
+        with patch(_BATCHER_SLEEP, new=AsyncMock()):
+            await batcher.flush()
+
+        assert [k for k, _ in errors] == [{"project_key": "p", "session_id": "bad"}]
+        assert _stats_tuple(batcher.stats) == (2, 3, 1, 2, 1, 1)
+
+    @pytest.mark.anyio
+    async def test_stats_is_a_frozen_snapshot_not_a_live_view(self) -> None:
+        store = _RecordingStore()
+        batcher = TranscriptMirrorBatcher(
+            store=store, projects_dir=PROJECTS_DIR, on_error=_noop_error
+        )
+        before = batcher.stats
+        batcher.enqueue(_main_path(), [{"type": "x"}])
+        after_enqueue = batcher.stats
+        await batcher.flush()
+        after_flush = batcher.stats
+
+        # Each read is a new object; earlier snapshots never change.
+        assert before is not after_enqueue and after_enqueue is not after_flush
+        assert _stats_tuple(before) == (0, 0, 0, 0, 0, 0)
+        assert _stats_tuple(after_enqueue) == (1, 1, 0, 0, 0, 0)
+        assert _stats_tuple(after_flush) == (1, 1, 1, 1, 0, 0)
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            after_flush.flushes = 99  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

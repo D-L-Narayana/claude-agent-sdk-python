@@ -8,6 +8,7 @@ unchanged against every supported ``mcp`` major version.
 
 import base64
 import gc
+import importlib
 import json
 import logging
 import threading
@@ -32,14 +33,17 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
     tool,
 )
-from claude_agent_sdk import (
-    _python_type_to_json_schema as python_type_to_json_schema,
-)
-from claude_agent_sdk import (
-    _typeddict_to_json_schema as typeddict_to_json_schema,
-)
 from claude_agent_sdk._internal import sdk_mcp_bridge
-from claude_agent_sdk._internal._mcp_compat import MCP_MAJOR
+from claude_agent_sdk._internal._mcp_compat import (
+    LOWLEVEL_SERVER_ATTRIBUTES,
+    MCP_MAJOR,
+    highlevel_server_class,
+    highlevel_tool_error_class,
+)
+from claude_agent_sdk._internal._schema import (
+    python_type_to_json_schema,
+    typeddict_to_json_schema,
+)
 from claude_agent_sdk._internal.query import Query
 
 INITIALIZE_PARAMS = {
@@ -1434,18 +1438,27 @@ def _chatty_server() -> Server:
 
 
 @pytest.mark.anyio
-async def test_server_initiated_notifications_are_dropped_and_the_call_completes():
-    """Nothing carries server-to-client traffic to the CLI yet; it must not
-    get in the way of the response the CLI is waiting for."""
+async def test_server_initiated_notifications_are_dropped_and_the_call_completes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing carries server-to-client traffic to the CLI yet; a notification
+    the bridge has no use for (list_changed) is dropped with a debug log and
+    must not get in the way of the response the CLI is waiting for."""
     config = McpSdkServerConfig(type="sdk", name="chatty", instance=_chatty_server())
 
     async with connected(config) as client:
-        with anyio.fail_after(5):
-            result = await client.call_tool("srv", "chat", {})
-            again = await client.call_tool("srv", "chat", {})
+        with caplog.at_level(logging.DEBUG, logger=sdk_mcp_bridge.__name__):
+            with anyio.fail_after(5):
+                result = await client.call_tool("srv", "chat", {})
+                again = await client.call_tool("srv", "chat", {})
 
     assert texts(result) == ["done"]
     assert texts(again) == ["done"]
+    dropped = [r for r in caplog.records if r.message.startswith("Dropping ")]
+    assert len(dropped) == 2, caplog.records
+    assert "'notifications/tools/list_changed'" in dropped[0].message
+    assert "'srv'" in dropped[0].message
+    assert all(r.levelno == logging.DEBUG for r in dropped)
 
 
 class _CrashingServer(Server):  # type: ignore[type-arg]
@@ -1840,6 +1853,349 @@ async def test_session_cancelled_before_it_starts_still_closes():
     assert session.finished
 
 
+# --- High-level servers (FastMCP on mcp 1.x, MCPServer on mcp 2.x) ------------
+
+
+# mcp 2.x marks the logging capability deprecated (SEP-2577) but still delivers
+# it on the protocol versions the CLI negotiates; the warning is not what the
+# tests below are about.
+_logging_is_deprecated_on_mcp_2 = pytest.mark.filterwarnings(
+    "ignore:The logging capability is deprecated"
+)
+
+
+def _highlevel_context_class() -> Any:
+    """The ``Context`` a high-level server injects into tools that ask for it
+    (``mcp.server.fastmcp.Context`` / ``mcp.server.mcpserver.Context``)."""
+    package = highlevel_server_class().__module__.rsplit(".", 1)[0]
+    return importlib.import_module(package).Context
+
+
+def _highlevel_server() -> Any:
+    """A server built with the installed mcp's high-level class (``FastMCP``
+    on 1.x, ``MCPServer`` on 2.x), the way most MCP servers are written: the
+    class derives each tool's schema from the function signature and wraps a
+    lowlevel ``Server`` that is what the SDK actually serves."""
+    server = highlevel_server_class()("fm")
+    tool_error = highlevel_tool_error_class()
+
+    @server.tool()
+    def shout(text: str, times: int = 1) -> str:
+        """Repeat text, loudly."""
+        return " ".join([text.upper()] * times)
+
+    @server.tool()
+    def explode(reason: str) -> str:
+        """Fails with a message meant for the caller."""
+        raise tool_error(reason)
+
+    @server.tool()
+    def crash(reason: str) -> str:
+        """Fails unexpectedly."""
+        raise ValueError(reason)
+
+    return server
+
+
+@pytest.mark.anyio
+async def test_highlevel_server_is_served_end_to_end() -> None:
+    """A FastMCP/MCPServer instance is accepted as an SDK server's ``instance``
+    and served through the lowlevel server it wraps: handshake, tools/list
+    with the schema the high-level class derived, tools/call with its result
+    and its error mapping."""
+    config = McpSdkServerConfig(type="sdk", name="fm", instance=_highlevel_server())
+    client = SdkMcpClient({"srv": config})
+    try:
+        with anyio.fail_after(5):
+            handshake = await client.request("srv", "initialize", INITIALIZE_PARAMS)
+            assert "error" not in handshake, handshake
+            await client.notify("srv", "notifications/initialized")
+            listed = {t["name"]: t for t in await client.list_tools("srv")}
+            result = await client.call_tool("srv", "shout", {"text": "hi", "times": 2})
+            failure = await client.call_tool("srv", "explode", {"reason": "boom"})
+            crashed = await client.call_tool("srv", "crash", {"reason": "oops"})
+        [bridge] = client.query._sdk_mcp_bridges.values()
+        assert isinstance(bridge._server, Server)  # the bridge keeps the lowlevel one
+    finally:
+        await client.aclose()
+
+    assert handshake["result"]["serverInfo"]["name"] == "fm"
+    assert set(listed) == {"shout", "explode", "crash"}
+    shout = listed["shout"]
+    assert shout["description"] == "Repeat text, loudly."
+    assert shout["inputSchema"]["properties"]["text"]["type"] == "string"
+    assert shout["inputSchema"]["properties"]["times"]["type"] == "integer"
+    assert shout["inputSchema"]["required"] == ["text"]
+    assert texts(result) == ["HI HI"]
+    assert result["isError"] is False
+    # ToolError is the high-level class's way to send a failure message to the
+    # caller verbatim; it must come through the bridge as an error result.
+    assert failure["isError"] is True
+    assert "boom" in texts(failure)[0]
+    # Any other exception is an error result too. mcp 2.x masks its text
+    # ("Error executing tool crash") while 1.x includes it, so only the shape
+    # is asserted here.
+    assert crashed["isError"] is True
+    [crash_text] = texts(crashed)
+    assert crash_text
+
+
+@_logging_is_deprecated_on_mcp_2
+@pytest.mark.anyio
+async def test_highlevel_server_tool_logs_reach_python_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The idiomatic high-level logging path (a tool's ``Context``) ends up on
+    the Python logger for the server, at the mapped level."""
+    context_class = _highlevel_context_class()
+    server = highlevel_server_class()("fm")
+
+    @server.tool()
+    async def careful(ctx: context_class) -> str:  # type: ignore[valid-type]
+        """Warns, then answers."""
+        await ctx.warning("careful: the disk is nearly full", logger_name="fm.tool")
+        return "done"
+
+    config = McpSdkServerConfig(type="sdk", name="fm", instance=server)
+    async with connected(config) as client:
+        with caplog.at_level(logging.DEBUG, logger="claude_agent_sdk.mcp.srv"):
+            with anyio.fail_after(5):
+                result = await client.call_tool("srv", "careful", {})
+
+    assert texts(result) == ["done"]
+    forwarded = [r for r in caplog.records if r.name == "claude_agent_sdk.mcp.srv"]
+    assert len(forwarded) == 1, caplog.records
+    [record] = forwarded
+    assert record.levelno == logging.WARNING
+    assert "careful: the disk is nearly full" in record.getMessage()
+    assert "fm.tool" in record.getMessage()
+
+
+# --- resolve_server ---------------------------------------------------------------
+
+
+def test_resolve_server_returns_a_lowlevel_server_unchanged() -> None:
+    server = create_sdk_mcp_server(name="srv", tools=[])["instance"]
+    assert sdk_mcp_bridge.resolve_server(server) is server
+
+
+def test_resolve_server_unwraps_the_installed_highlevel_class() -> None:
+    instance = highlevel_server_class()("fm")
+    resolved = sdk_mcp_bridge.resolve_server(instance)
+    assert isinstance(resolved, Server)
+    assert resolved is not instance
+    assert resolved.name == "fm"
+
+
+@pytest.mark.parametrize("attribute", LOWLEVEL_SERVER_ATTRIBUTES)
+def test_resolve_server_unwraps_anything_shaped_like_either_majors_class(
+    attribute: str,
+) -> None:
+    """``FastMCP`` (1.x) keeps its lowlevel server at ``_mcp_server``,
+    ``MCPServer`` (2.x) at ``_lowlevel_server``; both spellings are accepted
+    whichever major is installed."""
+    inner: Any = Server("inner")
+
+    class Wrapper:
+        pass
+
+    wrapper = Wrapper()
+    setattr(wrapper, attribute, inner)
+    assert sdk_mcp_bridge.resolve_server(wrapper) is inner
+
+
+def test_resolve_server_rejects_anything_else() -> None:
+    with pytest.raises(TypeError) as excinfo:
+        sdk_mcp_bridge.resolve_server(object())
+    message = str(excinfo.value)
+    assert "object" in message  # what was received
+    assert "mcp.server.Server" in message  # what is accepted...
+    assert "FastMCP" in message and "mcp 1.x" in message
+    assert "MCPServer" in message and "mcp 2.x" in message
+
+
+def test_resolve_server_rejects_a_wrapper_around_something_that_is_no_server() -> None:
+    class Wrapper:
+        _mcp_server = "not a server"
+        _lowlevel_server = None
+
+    with pytest.raises(TypeError, match="Wrapper"):
+        sdk_mcp_bridge.resolve_server(Wrapper())
+
+
+def test_bridge_resolves_its_server_when_constructed() -> None:
+    with pytest.raises(TypeError, match="FastMCP"):
+        sdk_mcp_bridge.SdkMcpBridge("srv", object())
+
+
+def test_query_rejects_an_invalid_sdk_server_instance_up_front() -> None:
+    config = McpSdkServerConfig(type="sdk", name="srv", instance=object())
+    with pytest.raises(TypeError, match="MCPServer"):
+        SdkMcpClient({"srv": config})
+
+
+# --- Server log forwarding ----------------------------------------------------------
+
+
+def _logging_server() -> Server:
+    """A hand-built server whose ``log`` tool sends the client a log message
+    (level, data and logger name taken from its arguments) and whose
+    ``progress`` tool reports progress, before answering."""
+    tools = [
+        mcp.types.Tool.model_validate(
+            {"name": name, "inputSchema": {"type": "object", "properties": {}}}
+        )
+        for name in ("log", "progress")
+    ]
+    done = mcp.types.CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": "done"}]}
+    )
+
+    async def notify(
+        session: Any, name: str, arguments: dict[str, Any]
+    ) -> mcp.types.CallToolResult:
+        if name == "log":
+            await session.send_log_message(
+                level=arguments.get("level", "info"),
+                data=arguments.get("data", "careful"),
+                logger=arguments.get("logger"),
+            )
+        else:
+            await session.send_progress_notification(
+                progress_token="tok",
+                progress=arguments.get("progress", 1),
+                total=arguments.get("total"),
+                message=arguments.get("message"),
+            )
+        return done
+
+    if MCP_MAJOR >= 2:
+
+        async def on_list_tools(ctx: Any, params: Any) -> mcp.types.ListToolsResult:
+            return mcp.types.ListToolsResult(tools=tools)
+
+        async def on_call_tool(ctx: Any, params: Any) -> mcp.types.CallToolResult:
+            return await notify(ctx.session, params.name, params.arguments or {})
+
+        return Server(
+            "logging",
+            version="0.1.0",
+            on_list_tools=on_list_tools,
+            on_call_tool=on_call_tool,
+        )
+
+    server = Server("logging", version="0.1.0")
+
+    @server.list_tools()
+    async def list_tools() -> list[mcp.types.Tool]:
+        return tools
+
+    @server.call_tool()
+    async def call_tool(
+        name: str, arguments: dict[str, Any]
+    ) -> mcp.types.CallToolResult:
+        return await notify(server.request_context.session, name, arguments)
+
+    return server
+
+
+def _forwarded(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "claude_agent_sdk.mcp.srv"]
+
+
+@_logging_is_deprecated_on_mcp_2
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("mcp_level", "python_level"),
+    [
+        ("debug", logging.DEBUG),
+        ("info", logging.INFO),
+        ("notice", logging.INFO),
+        ("warning", logging.WARNING),
+        ("error", logging.ERROR),
+        ("critical", logging.CRITICAL),
+        ("alert", logging.CRITICAL),
+        ("emergency", logging.CRITICAL),
+    ],
+)
+async def test_server_log_messages_are_forwarded_at_the_mapped_level(
+    caplog: pytest.LogCaptureFixture, mcp_level: str, python_level: int
+) -> None:
+    """``notifications/message`` from the server lands on the logger
+    ``claude_agent_sdk.mcp.<server name>`` at the Python level the MCP level
+    maps to, with the server's own logger name in the message."""
+    config = McpSdkServerConfig(type="sdk", name="logging", instance=_logging_server())
+    async with connected(config) as client:
+        with caplog.at_level(logging.DEBUG, logger="claude_agent_sdk.mcp.srv"):
+            with anyio.fail_after(5):
+                result = await client.call_tool(
+                    "srv",
+                    "log",
+                    {"level": mcp_level, "data": "careful", "logger": "fm.tool"},
+                )
+
+    assert texts(result) == ["done"]
+    forwarded = _forwarded(caplog)
+    assert len(forwarded) == 1, caplog.records
+    [record] = forwarded
+    assert record.levelno == python_level
+    assert "careful" in record.getMessage()
+    assert "fm.tool" in record.getMessage()
+    # The raw notification fields ride along for structured log handlers.
+    assert record.mcp_server == "srv"  # type: ignore[attr-defined]
+    assert record.mcp_level == mcp_level  # type: ignore[attr-defined]
+    assert record.mcp_logger == "fm.tool"  # type: ignore[attr-defined]
+    assert record.mcp_data == "careful"  # type: ignore[attr-defined]
+
+
+@_logging_is_deprecated_on_mcp_2
+@pytest.mark.anyio
+async def test_structured_log_data_is_rendered_as_json(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = McpSdkServerConfig(type="sdk", name="logging", instance=_logging_server())
+    async with connected(config) as client:
+        with caplog.at_level(logging.DEBUG, logger="claude_agent_sdk.mcp.srv"):
+            with anyio.fail_after(5):
+                await client.call_tool(
+                    "srv",
+                    "log",
+                    {"level": "error", "data": {"step": 3, "ok": False}},
+                )
+
+    [record] = _forwarded(caplog)
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == '{"step": 3, "ok": false}'  # no logger name given
+    assert record.mcp_data == {"step": 3, "ok": False}  # type: ignore[attr-defined]
+    assert record.mcp_logger is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_progress_notifications_are_logged_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = McpSdkServerConfig(type="sdk", name="logging", instance=_logging_server())
+    async with connected(config) as client:
+        with caplog.at_level(logging.DEBUG, logger="claude_agent_sdk.mcp.srv"):
+            with anyio.fail_after(5):
+                result = await client.call_tool(
+                    "srv",
+                    "progress",
+                    {"progress": 1, "total": 4, "message": "a quarter done"},
+                )
+        # Nothing is logged above DEBUG for progress.
+        with caplog.at_level(logging.INFO, logger="claude_agent_sdk.mcp.srv"):
+            before = len(_forwarded(caplog))
+            await client.call_tool("srv", "progress", {"progress": 2})
+            assert len(_forwarded(caplog)) == before
+
+    assert texts(result) == ["done"]
+    [record] = _forwarded(caplog)
+    assert record.levelno == logging.DEBUG
+    assert "1" in record.getMessage() and "4" in record.getMessage()
+    assert "a quarter done" in record.getMessage()
+
+
 # --- Tests for _python_type_to_json_schema and TypedDict schema conversion ---
 
 
@@ -1877,15 +2233,23 @@ class TestPythonTypeToJsonSchema:
         }
 
     def test_parameterized_dict(self) -> None:
-        assert python_type_to_json_schema(dict[str, int]) == {"type": "object"}
+        # The value type is kept so the arguments are validated against it;
+        # only bare dict / dict[str, Any] stay an unconstrained object.
+        assert python_type_to_json_schema(dict[str, int]) == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        assert python_type_to_json_schema(dict[str, Any]) == {"type": "object"}
 
+    # A None argument must validate when the hint allows it: the null
+    # alternative is kept in the schema rather than dropped from the union.
     def test_optional_str(self) -> None:
         result = python_type_to_json_schema(str | None)
-        assert result == {"type": "string"}
+        assert result == {"anyOf": [{"type": "string"}, {"type": "null"}]}
 
     def test_optional_int_union_syntax(self) -> None:
         result = python_type_to_json_schema(int | None)
-        assert result == {"type": "integer"}
+        assert result == {"anyOf": [{"type": "integer"}, {"type": "null"}]}
 
     def test_multi_type_union(self) -> None:
         result = python_type_to_json_schema(str | int)
@@ -1894,9 +2258,10 @@ class TestPythonTypeToJsonSchema:
         }
 
     def test_multi_type_union_with_none(self) -> None:
+        # None is one of the allowed alternatives, so it must validate too.
         result = python_type_to_json_schema(str | int | None)
         assert result == {
-            "anyOf": [{"type": "string"}, {"type": "integer"}],
+            "anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}],
         }
 
     def test_unknown_type_defaults_to_string(self) -> None:

@@ -117,6 +117,92 @@ class ResultError(ProcessError):
         super().__init__(message, exit_code=exit_code)
 
 
+class ControlRequestError(ClaudeSDKError):
+    """The CLI answered a control request with an error, or it could not be delivered.
+
+    Control requests are the calls the SDK makes to Claude Code over the
+    control protocol: ``initialize``, ``interrupt``, ``set_model``,
+    ``set_permission_mode``, ``rewind_files``, ``mcp_status``,
+    ``mcp_reconnect``, ``mcp_toggle``, ``stop_task`` and
+    ``get_context_usage`` (see the matching :class:`ClaudeSDKClient`
+    methods). When the CLI refuses one it answers with an error response,
+    which is raised as this exception; the message is the CLI's error text::
+
+        try:
+            await client.set_model("claude-nonexistent")
+        except ControlRequestError as e:
+            print(e.subtype, e.request_id, e)   # set_model req_3_... Model ... not found
+
+    It is also raised when the request cannot be sent at all (control
+    requests need streaming mode). It is *not* a :class:`ProcessError`: the
+    CLI is alive and the session can go on. A request the CLI never answers
+    raises the :class:`ControlRequestTimeoutError` subclass.
+
+    Attributes:
+        subtype: The subtype of the request that failed (``"set_model"``,
+            ``"interrupt"``, ...), if known.
+        request_id: The SDK-assigned id of the failed request, if it was sent.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        subtype: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        # `subtype`/`request_id` are keyword-only with defaults so the default
+        # exception reconstruction protocol (``type(e)(*e.args)``, used by
+        # pickle/copy and therefore by multiprocessing) still works; the real
+        # attributes are restored from ``__dict__`` afterwards.
+        self.subtype: str | None = subtype
+        self.request_id: str | None = request_id
+        super().__init__(message)
+
+
+def _rebuild_control_request_timeout_error(
+    cls: type["ControlRequestTimeoutError"], args: tuple[Any, ...], timeout: float
+) -> "ControlRequestTimeoutError":
+    """Reconstruct a :class:`ControlRequestTimeoutError` for pickle/copy."""
+    return cls(*args, timeout=timeout)
+
+
+class ControlRequestTimeoutError(ControlRequestError):
+    """No ``control_response`` arrived within the timeout.
+
+    Raised by the control-request methods when Claude Code does not answer
+    in time (60 seconds for most requests; ``initialize`` waits longer, see
+    ``CLAUDE_CODE_STREAM_CLOSE_TIMEOUT``). The message keeps the form
+    ``Control request timeout: <subtype>``.
+
+    Attributes:
+        timeout: How long the SDK waited, in seconds.
+        subtype: Inherited; the subtype of the request that timed out.
+        request_id: Inherited; the id of the request that timed out.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        timeout: float,
+        subtype: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        self.timeout: float = timeout
+        super().__init__(message, subtype=subtype, request_id=request_id)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # `timeout` is a required keyword, so ``type(e)(*e.args)`` cannot
+        # rebuild this exception; hand pickle/copy a reconstructor that
+        # passes it along. ``__dict__`` restores the rest as usual.
+        return (
+            _rebuild_control_request_timeout_error,
+            (type(self), self.args, self.timeout),
+            self.__dict__,
+        )
+
+
 class CLIJSONDecodeError(ClaudeSDKError):
     """Raised when unable to decode JSON from CLI output."""
 

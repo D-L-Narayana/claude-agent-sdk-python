@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -127,6 +128,113 @@ class TestMainTranscript:
         assert spy.await_count == 1
         key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
         assert store.get_entries(key) == entries
+
+
+# ---------------------------------------------------------------------------
+# Corrupt JSONL lines
+# ---------------------------------------------------------------------------
+
+_IMPORT_LOGGER = "claude_agent_sdk._internal.session_import"
+
+
+def _import_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """WARNING-or-higher records emitted by the session_import module logger."""
+    return [
+        r
+        for r in caplog.records
+        if r.name == _IMPORT_LOGGER and r.levelno >= logging.WARNING
+    ]
+
+
+class TestCorruptLines:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("bad_line", ["not json {", "[1, 2]", "42"])
+    async def test_corrupt_line_is_skipped_with_warning_and_rest_imported(
+        self,
+        claude_dir: Path,
+        cwd: Path,
+        project_key: str,
+        caplog: pytest.LogCaptureFixture,
+        bad_line: str,
+    ) -> None:
+        """A line that is not a JSON object must not abort the import (parity
+        with ``_parse_transcript_entries``); it is skipped with a warning
+        that names the file and line number."""
+        path = claude_dir / f"{SESSION_ID}.jsonl"
+        path.write_text(
+            json.dumps(_entry(0))
+            + "\n"
+            + bad_line
+            + "\n"
+            + json.dumps(_entry(1))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        store = InMemorySessionStore()
+        with caplog.at_level(logging.WARNING, logger=_IMPORT_LOGGER):
+            await import_session_to_store(SESSION_ID, store, directory=str(cwd))
+
+        key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
+        assert store.get_entries(key) == [_entry(0), _entry(1)]
+
+        warnings = _import_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(path) in message
+        assert "line 2" in message
+
+    @pytest.mark.anyio
+    async def test_corrupt_line_in_subagent_transcript_is_skipped(
+        self,
+        claude_dir: Path,
+        cwd: Path,
+        project_key: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _write_jsonl(claude_dir / f"{SESSION_ID}.jsonl", [_entry(0)])
+        sub_file = claude_dir / SESSION_ID / "subagents" / "agent-abc.jsonl"
+        sub_file.parent.mkdir(parents=True)
+        sub_file.write_text(
+            json.dumps(_entry(10)) + "\n{truncated\n" + json.dumps(_entry(11)) + "\n",
+            encoding="utf-8",
+        )
+
+        store = InMemorySessionStore()
+        with caplog.at_level(logging.WARNING, logger=_IMPORT_LOGGER):
+            await import_session_to_store(SESSION_ID, store, directory=str(cwd))
+
+        sub_key: SessionKey = {
+            "project_key": project_key,
+            "session_id": SESSION_ID,
+            "subpath": "subagents/agent-abc",
+        }
+        assert store.get_entries(sub_key) == [_entry(10), _entry(11)]
+        warnings = _import_warnings(caplog)
+        assert len(warnings) == 1
+        assert str(sub_file) in warnings[0].getMessage()
+
+    @pytest.mark.anyio
+    async def test_whitespace_only_line_is_treated_as_blank(
+        self,
+        claude_dir: Path,
+        cwd: Path,
+        project_key: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = claude_dir / f"{SESSION_ID}.jsonl"
+        path.write_text(
+            json.dumps(_entry(0)) + "\n   \n" + json.dumps(_entry(1)) + "\n",
+            encoding="utf-8",
+        )
+
+        store = InMemorySessionStore()
+        with caplog.at_level(logging.WARNING, logger=_IMPORT_LOGGER):
+            await import_session_to_store(SESSION_ID, store, directory=str(cwd))
+
+        key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
+        assert store.get_entries(key) == [_entry(0), _entry(1)]
+        assert _import_warnings(caplog) == []
 
 
 # ---------------------------------------------------------------------------

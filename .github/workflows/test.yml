@@ -78,9 +78,44 @@ jobs:
           flags: mcp-v1-floor
           fail_ci_if_error: false
 
+  test-min-python:
+    # The jobs above run on the newest Python only. This one runs the suite on
+    # the oldest Python the package declares (requires-python in
+    # pyproject.toml), so a 3.11+-only construct fails on the PR instead of in
+    # the manual publish workflow's version matrix.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Quoted: an unquoted 3.10 is the YAML float 3.1.
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v
+
   test-e2e:
-    # Skip on forks since they can't mint the OIDC token used for Claude API auth
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Runs on pushes and same-repository PRs, and only when the workload-identity
+    # variables are configured. A fork without them skips this job instead of
+    # failing in setup-claude-auth -- and then no real-API validation ran, which
+    # is not the same as the offline jobs passing. An external PR never gets this
+    # job, even when the base repository has the variables: its OIDC token could
+    # not be exchanged for a Claude API token. GitHub reads an unset variable as ''.
+    if: >-
+      (github.event_name == 'push'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.ANTHROPIC_FEDERATION_RULE_ID != ''
+      && vars.ANTHROPIC_ORGANIZATION_ID != ''
+      && vars.ANTHROPIC_SERVICE_ACCOUNT_ID != ''
     runs-on: ${{ matrix.os }}
     needs: test # Run after unit tests pass
     permissions:
@@ -150,8 +185,15 @@ jobs:
           python -m pytest e2e-tests/ -v -m e2e
 
   test-e2e-docker:
-    # Skip on forks since they can't mint the OIDC token used for Claude API auth
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Same gate as test-e2e (see the comment there): a trusted event -- a push,
+    # or a PR from this repository -- and the workload-identity variables
+    # configured. A fork without them skips this job.
+    if: >-
+      (github.event_name == 'push'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.ANTHROPIC_FEDERATION_RULE_ID != ''
+      && vars.ANTHROPIC_ORGANIZATION_ID != ''
+      && vars.ANTHROPIC_SERVICE_ACCOUNT_ID != ''
     runs-on: ubuntu-latest
     needs: test # Run after unit tests pass
     permissions:
@@ -187,8 +229,15 @@ jobs:
             claude-sdk-test python -m pytest e2e-tests/ -v -m e2e
 
   test-examples:
-    # Skip on forks since they can't mint the OIDC token used for Claude API auth
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Same gate as test-e2e (see the comment there): a trusted event -- a push,
+    # or a PR from this repository -- and the workload-identity variables
+    # configured. A fork without them skips this job.
+    if: >-
+      (github.event_name == 'push'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.ANTHROPIC_FEDERATION_RULE_ID != ''
+      && vars.ANTHROPIC_ORGANIZATION_ID != ''
+      && vars.ANTHROPIC_SERVICE_ACCOUNT_ID != ''
     runs-on: ubuntu-latest
     needs: test-e2e # Run after e2e tests
     permissions:

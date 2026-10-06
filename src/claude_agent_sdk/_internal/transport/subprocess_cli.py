@@ -8,6 +8,8 @@ import platform
 import re
 import shutil
 import signal
+import sys
+from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import suppress
 from pathlib import Path
@@ -42,6 +44,97 @@ VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION = "2.1.248"
 # Query reads to tell when the run is over and keeps out of the caller's
 # stream (see Query._read_messages). CLIs that predate it send no frames.
 _SDK_READS_SESSION_STATE_ENV = "CLAUDE_CODE_SDK_READS_SESSION_STATE"
+
+# The CLI's stderr is piped by default so its diagnostics can be captured
+# for error reporting (see SubprocessCLITransport._handle_stderr) and
+# re-emitted on this process's stderr. Setting this to "1" restores plain
+# file-descriptor inheritance instead: the CLI writes straight to our
+# stderr, nothing is read, and no tail is kept. Ignored when the caller
+# registered an ``options.stderr`` callback, which needs the pipe.
+_INHERIT_STDERR_ENV = "CLAUDE_AGENT_SDK_INHERIT_STDERR"
+# Bounds of the stderr tail kept for crash diagnostics: at most this many
+# complete lines, and at most this many characters of joined text.
+_STDERR_TAIL_MAX_LINES = 40
+_STDERR_TAIL_MAX_CHARS = 8192
+
+# `claude -v` results, keyed by (path, st_size, st_mtime_ns). Spawning the
+# probe on every connect() costs a full CLI start-up, and a binary that has
+# not changed on disk reports the same version, so the result is reused for
+# the life of the process. The key is only computed when os.stat succeeds:
+# a path that cannot be stat-ed is probed every time and never cached.
+_CliVersionKey = tuple[str, int, int]
+_CLI_VERSION_CACHE: dict[_CliVersionKey, str] = {}
+# Binaries (same key) the minimum-version warning was already logged for.
+_MIN_VERSION_WARNED: set[_CliVersionKey] = set()
+
+
+def _cli_version_cache_key(cli_path: str) -> _CliVersionKey | None:
+    """Identity of the binary at ``cli_path``, or None if it cannot be stat-ed."""
+    try:
+        st = Path(cli_path).stat()
+    except (OSError, ValueError):
+        return None
+    return (cli_path, st.st_size, st.st_mtime_ns)
+
+
+def clear_cli_version_cache() -> None:
+    """Forget every cached ``claude -v`` result and once-only warning.
+
+    Test hook: the cache lives for the whole process, so tests whose mocked
+    probe answers differ for the same path start from an empty cache.
+    """
+    _CLI_VERSION_CACHE.clear()
+    _MIN_VERSION_WARNED.clear()
+
+
+async def _probe_cli_version(cli_path: str) -> str | None:
+    """Return the ``X.Y.Z`` that ``cli_path -v`` reports, or None.
+
+    The result is cached per binary -- keyed by path, size and mtime -- so a
+    process that opens many sessions pays for the probe once rather than on
+    every connect(). The key exists only when ``os.stat`` succeeds; a path
+    that cannot be stat-ed is probed every time and never cached. Only a
+    successfully parsed version is cached: a probe that times out or prints
+    something unexpected is retried on the next connect().
+
+    The probe itself is unchanged from when it ran on every connect(): a 2 s
+    cap, every error swallowed (the check is advisory), and the probe
+    process terminated and reaped in ``finally``.
+    """
+    key = _cli_version_cache_key(cli_path)
+    if key is not None:
+        cached = _CLI_VERSION_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    version: str | None = None
+    version_process: Process | None = None
+    try:
+        with anyio.fail_after(2):  # 2 second timeout
+            version_process = await anyio.open_process(
+                [cli_path, "-v"],
+                stdout=PIPE,
+                stderr=PIPE,
+            )
+            if version_process.stdout:
+                stdout_bytes = await version_process.stdout.receive()
+                version_output = stdout_bytes.decode().strip()
+                match = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", version_output)
+                if match:
+                    version = match.group(1)
+    except Exception:
+        pass
+    finally:
+        if version_process:
+            with suppress(Exception):
+                version_process.terminate()
+            with suppress(Exception):
+                await version_process.wait()
+
+    if version is not None and key is not None:
+        _CLI_VERSION_CACHE[key] = version
+    return version
+
 
 # cmd.exe metacharacters (plus the quote character cmd.exe uses to toggle
 # its quoting state, and "!", which expands like "%" when delayed expansion
@@ -251,6 +344,70 @@ class SubprocessCLITransport(Transport):
             else _DEFAULT_MAX_BUFFER_SIZE
         )
         self._write_lock: anyio.Lock = anyio.Lock()
+        self._cli_version: str | None = None
+        # Most recent complete stderr lines from the CLI, for error reports.
+        # Bounded in lines by the deque and in characters by
+        # _record_stderr_line; _stderr_tail_chars is the sum of line lengths.
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_MAX_LINES)
+        self._stderr_tail_chars = 0
+
+    @property
+    def cli_version(self) -> str | None:
+        """Version of the Claude Code CLI this transport probed, as ``"X.Y.Z"``.
+
+        Filled in by :meth:`connect` from the (cached) ``claude -v`` probe.
+        None before connect(), when ``CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK``
+        is set, or when the probe failed or printed something unexpected.
+        """
+        return self._cli_version
+
+    def _stderr_tail_text(self) -> str | None:
+        """The most recent CLI stderr lines, newline-joined, or None if none."""
+        if not self._stderr_tail:
+            return None
+        return "\n".join(self._stderr_tail)
+
+    def _record_stderr_line(self, line: str) -> None:
+        """Append one complete stderr line to the bounded tail.
+
+        At most _STDERR_TAIL_MAX_LINES lines and _STDERR_TAIL_MAX_CHARS
+        characters of joined text are kept, dropping the oldest lines first.
+        A single line longer than the whole budget is truncated rather than
+        dropped, so the newest diagnostic is never lost.
+        """
+        if len(line) > _STDERR_TAIL_MAX_CHARS:
+            line = line[:_STDERR_TAIL_MAX_CHARS]
+        tail = self._stderr_tail
+        if len(tail) >= _STDERR_TAIL_MAX_LINES:
+            self._stderr_tail_chars -= len(tail.popleft())
+        tail.append(line)
+        self._stderr_tail_chars += len(line)
+        # The joined text is the lines plus one separator between each pair.
+        while (
+            len(tail) > 1
+            and self._stderr_tail_chars + len(tail) - 1 > _STDERR_TAIL_MAX_CHARS
+        ):
+            self._stderr_tail_chars -= len(tail.popleft())
+
+    def _with_stderr_tail(self, message: str) -> str:
+        """Append the stderr tail to an error message when there is one."""
+        tail = self._stderr_tail_text()
+        if tail is None:
+            return message
+        return f"{message}\nCLI stderr (last lines):\n{tail}"
+
+    async def _drain_stderr(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for the stderr reader to finish.
+
+        Once the CLI has exited its stderr pipe closes and the reader ends on
+        its own, so this normally returns at once; the bound covers a mock
+        stream or a grandchild still holding the pipe open.
+        """
+        task = self._stderr_task
+        if task is None or task.done():
+            return
+        with anyio.move_on_after(timeout), suppress(Exception):
+            await task.wait()
 
     def _find_cli(self) -> str:
         """Find Claude Code CLI binary."""
@@ -867,8 +1024,20 @@ class SubprocessCLITransport(Transport):
             if self._cwd:
                 process_env["PWD"] = self._cwd
 
-            # Pipe stderr only when the caller registered a callback.
-            stderr_dest = PIPE if self._options.stderr is not None else None
+            # Pipe stderr so the CLI's diagnostics can be kept for error
+            # reports (the tail in ProcessError / CLIConnectionError) and
+            # delivered to options.stderr or re-emitted on our own stderr.
+            # CLAUDE_AGENT_SDK_INHERIT_STDERR=1 restores plain fd inheritance
+            # -- nothing read, no tail -- unless a callback needs the pipe.
+            inherit_stderr = (
+                self._options.stderr is None
+                and os.environ.get(_INHERIT_STDERR_ENV) == "1"
+            )
+            stderr_dest = None if inherit_stderr else PIPE
+
+            # A fresh child gets a fresh tail.
+            self._stderr_tail.clear()
+            self._stderr_tail_chars = 0
 
             self._process = await anyio.open_process(
                 cmd,
@@ -886,7 +1055,11 @@ class SubprocessCLITransport(Transport):
 
             # Setup stderr stream if piped
             if stderr_dest is PIPE and self._process.stderr:
-                self._stderr_stream = TextReceiveStream(self._process.stderr)
+                # errors="replace": one undecodable byte in a diagnostic must
+                # not end the reader (and with it the tail) for the session.
+                self._stderr_stream = TextReceiveStream(
+                    self._process.stderr, errors="replace"
+                )
                 # Spawn the stderr reader via spawn_detached (not a manually-
                 # entered TaskGroup) so cleanup has no trio task-affinity —
                 # same pattern as Query._read_task.
@@ -915,7 +1088,13 @@ class SubprocessCLITransport(Transport):
             raise error from e
 
     async def _handle_stderr(self) -> None:
-        """Handle stderr stream - read and invoke callbacks."""
+        """Read the CLI's stderr: keep a bounded tail, then deliver each line.
+
+        Lines go to ``options.stderr`` when the caller registered a callback;
+        otherwise they are re-emitted on this process's ``sys.stderr``, so
+        piping the CLI's stderr (needed for the tail) does not hide the
+        diagnostics the caller used to see through fd inheritance.
+        """
         if not self._stderr_stream:
             return
 
@@ -924,15 +1103,30 @@ class SubprocessCLITransport(Transport):
             if not line:
                 return
 
+            self._record_stderr_line(line)
+
             # Call the stderr callback if provided. Isolate per-line so a
             # raise in the user's callback doesn't terminate the loop and
             # silently drop every subsequent line for the rest of the
             # session.
-            if self._options.stderr:
+            callback = self._options.stderr
+            if callback is not None:
                 try:
-                    self._options.stderr(line)
+                    callback(line)
                 except Exception:
                     logger.debug("stderr callback raised; continuing", exc_info=True)
+                return
+
+            # Tee to our own stderr, looked up per line: test runners swap
+            # sys.stderr at runtime, and it can be None (no console) or
+            # already closed at interpreter shutdown. Never let the tee take
+            # the reader down.
+            stream = getattr(sys, "stderr", None)
+            if stream is None:
+                return
+            with suppress(Exception):
+                stream.write(line + "\n")
+                stream.flush()
 
         # `options.stderr` is documented to receive lines, but the stream yields
         # chunks, so frame the lines here rather than handing the callback
@@ -1068,8 +1262,16 @@ class SubprocessCLITransport(Transport):
                 raise CLIConnectionError("ProcessTransport is not ready for writing")
 
             if self._process and self._process.returncode is not None:
+                # The usual symptom of a CLI that died at start-up (bad
+                # credentials, refused resume, ...) is this error on the
+                # first write. Let the stderr reader finish so the message
+                # carries what the CLI said before exiting.
+                await self._drain_stderr(0.5)
                 raise CLIConnectionError(
-                    f"Cannot write to terminated process (exit code: {self._process.returncode})"
+                    self._with_stderr_tail(
+                        "Cannot write to terminated process "
+                        f"(exit code: {self._process.returncode})"
+                    )
                 )
 
             if self._exit_error:
@@ -1081,10 +1283,32 @@ class SubprocessCLITransport(Transport):
                 await self._stdin_stream.send(data)
             except Exception as e:
                 self._ready = False
+                detail = await self._exit_detail_after_write_failure()
                 self._exit_error = CLIConnectionError(
-                    f"Failed to write to process stdin: {e}"
+                    f"Failed to write to process stdin: {e}{detail}"
                 )
                 raise self._exit_error from e
+
+    async def _exit_detail_after_write_failure(self) -> str:
+        """Explain a failed stdin write by the CLI's exit, if it has exited.
+
+        A broken pipe usually means the CLI died, but on asyncio the exit code
+        can lag behind the pipe error (the child watcher reaps asynchronously),
+        so wait briefly for it; then drain the stderr reader so the tail holds
+        what the CLI said before dying. Returns "" when the CLI is still alive.
+        """
+        process = self._process
+        if process is None:
+            return ""
+        if process.returncode is None:
+            with anyio.move_on_after(0.5), suppress(Exception):
+                await process.wait()
+        if process.returncode is None:
+            return ""
+        await self._drain_stderr(0.5)
+        return self._with_stderr_tail(
+            f" (the CLI exited with code {process.returncode})"
+        )
 
     async def end_input(self) -> None:
         """End the input stream (close stdin)."""
@@ -1154,74 +1378,63 @@ class SubprocessCLITransport(Transport):
 
         # Use exit code for error detection
         if returncode is not None and returncode != 0:
+            # Let the stderr reader drain what the CLI wrote before exiting
+            # so the tail below is complete (bounded; see _drain_stderr).
+            await self._drain_stderr(1)
+            stderr_tail = self._stderr_tail_text()
             self._exit_error = ProcessError(
                 f"Command failed with exit code {returncode}",
                 exit_code=returncode,
-                stderr="Check stderr output for details",
+                stderr=stderr_tail or "Check stderr output for details",
             )
             raise self._exit_error
 
     async def _check_claude_version(self) -> None:
-        """Check Claude Code version and warn if below minimum."""
+        """Check Claude Code version and warn if below minimum.
+
+        The version comes from :func:`_probe_cli_version` (cached per binary)
+        and is exposed as :attr:`cli_version`. The minimum-version warning
+        describes the binary, so it is logged once per cached binary per
+        process (a path that cannot be cached warns on every connect, as
+        before); the ``verbatim_prompts`` warning depends on this transport's
+        options, so it is evaluated on every connect.
+        """
         if self._cli_path is None:
             raise CLINotFoundError("CLI path not resolved. Call connect() first.")
-        version_process = None
-        try:
-            with anyio.fail_after(2):  # 2 second timeout
-                version_process = await anyio.open_process(
-                    [self._cli_path, "-v"],
-                    stdout=PIPE,
-                    stderr=PIPE,
+        version = await _probe_cli_version(self._cli_path)
+        self._cli_version = version
+        if version is None:
+            return
+        version_parts = [int(x) for x in version.split(".")]
+        min_parts = [int(x) for x in MINIMUM_CLAUDE_CODE_VERSION.split(".")]
+
+        if version_parts < min_parts:
+            key = _cli_version_cache_key(self._cli_path)
+            if key is None or key not in _MIN_VERSION_WARNED:
+                if key is not None:
+                    _MIN_VERSION_WARNED.add(key)
+                logger.warning(
+                    "Claude Code version %s at %s is unsupported in the Agent SDK. "
+                    "Minimum required version is %s. "
+                    "Some features may not work correctly.",
+                    version,
+                    self._cli_path,
+                    MINIMUM_CLAUDE_CODE_VERSION,
                 )
 
-                if version_process.stdout:
-                    stdout_bytes = await version_process.stdout.receive()
-                    version_output = stdout_bytes.decode().strip()
-
-                    match = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", version_output)
-                    if match:
-                        version = match.group(1)
-                        version_parts = [int(x) for x in version.split(".")]
-                        min_parts = [
-                            int(x) for x in MINIMUM_CLAUDE_CODE_VERSION.split(".")
-                        ]
-
-                        if version_parts < min_parts:
-                            logger.warning(
-                                "Claude Code version %s at %s is unsupported in the Agent SDK. "
-                                "Minimum required version is %s. "
-                                "Some features may not work correctly.",
-                                version,
-                                self._cli_path,
-                                MINIMUM_CLAUDE_CODE_VERSION,
-                            )
-
-                        verbatim_min_parts = [
-                            int(x)
-                            for x in VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION.split(
-                                "."
-                            )
-                        ]
-                        if self._options.verbatim_prompts and (
-                            version_parts < verbatim_min_parts
-                        ):
-                            logger.warning(
-                                "verbatim_prompts is enabled, but Claude Code "
-                                "version %s at %s ignores it: prompts will still "
-                                "have @path mentions expanded and slash commands "
-                                "dispatched. Claude Code %s or later is required.",
-                                version,
-                                self._cli_path,
-                                VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION,
-                            )
-        except Exception:
-            pass
-        finally:
-            if version_process:
-                with suppress(Exception):
-                    version_process.terminate()
-                with suppress(Exception):
-                    await version_process.wait()
+        verbatim_min_parts = [
+            int(x) for x in VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION.split(".")
+        ]
+        if self._options.verbatim_prompts and (version_parts < verbatim_min_parts):
+            logger.warning(
+                "verbatim_prompts is enabled, but Claude Code "
+                "version %s at %s ignores it: prompts will still "
+                "have @path mentions expanded and slash commands "
+                "dispatched. Claude Code %s or later is required.",
+                version,
+                self._cli_path,
+                VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION,
+            )
 
     def is_ready(self) -> bool:
         """Check if transport is ready for communication."""

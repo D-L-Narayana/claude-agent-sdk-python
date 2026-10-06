@@ -19,6 +19,8 @@ import asyncio
 import contextlib
 import sys
 
+import anyio
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -286,13 +288,14 @@ async def example_async_iterable_prompt():
         # fewer ResultMessages, so we cannot assume a 1:1 mapping.  We call
         # receive_response() in a loop with a short timeout so we drain all
         # available results without hanging if fewer results arrive than
-        # messages were sent.
+        # messages were sent. anyio.move_on_after works inside asyncio.run()
+        # and on Python 3.10, the SDK's minimum, where asyncio.timeout does
+        # not exist yet.
         while True:
-            try:
-                async with asyncio.timeout(30.0):
-                    async for msg in client.receive_response():
-                        display_message(msg)
-            except (asyncio.TimeoutError, StopAsyncIteration):
+            with anyio.move_on_after(30.0) as scope:
+                async for msg in client.receive_response():
+                    display_message(msg)
+            if scope.cancelled_caught:
                 break
 
     print("\n")
@@ -439,10 +442,12 @@ async def example_error_handling():
             "Run a bash sleep command for 5 seconds not in the background"
         )
 
-        # Try to receive response with a short timeout
+        # Try to receive response with a short timeout. anyio.fail_after
+        # raises TimeoutError when the block overruns; it works on Python
+        # 3.10 (the SDK's minimum), where asyncio.timeout does not exist.
         try:
             messages = []
-            async with asyncio.timeout(3.0):
+            with anyio.fail_after(3.0):
                 async for msg in client.receive_response():
                     messages.append(msg)
                     if isinstance(msg, AssistantMessage):
@@ -453,7 +458,7 @@ async def example_error_handling():
                         display_message(msg)
                         break
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print(
                 "\nResponse timeout after 3 seconds - demonstrating graceful handling"
             )

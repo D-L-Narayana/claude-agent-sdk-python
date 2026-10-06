@@ -6,7 +6,10 @@ and hands them to :class:`TranscriptMirrorBatcher.enqueue`, which accumulates
 them and flushes to :meth:`SessionStore.append` either when a ``result``
 message arrives (explicit flush) or when the pending buffer exceeds size
 thresholds (eager background flush). This keeps adapter latency off the
-hot path during model streaming.
+hot path during model streaming. :attr:`TranscriptMirrorBatcher.stats`
+exposes lifetime counters (frames/entries enqueued, flushes, entries
+flushed, batches failed and entries dropped) as an immutable
+:class:`MirrorStats` snapshot.
 """
 
 from __future__ import annotations
@@ -42,6 +45,32 @@ class _MirrorEntry:
     bytes: int
 
 
+@dataclass(frozen=True)
+class MirrorStats:
+    """Point-in-time snapshot of :attr:`TranscriptMirrorBatcher.stats`.
+
+    Immutable: read the property again for fresh numbers. A non-zero
+    ``batches_failed``/``entries_dropped`` means the store is missing entries
+    (each drop was also reported via ``on_error`` as a ``MirrorErrorMessage``)
+    and ``sync_session_to_store()`` can repair the gap. Frames whose file
+    path cannot be mapped to a :class:`SessionKey` are dropped with a warning
+    and counted in neither ``entries_flushed`` nor ``entries_dropped``.
+    """
+
+    frames_enqueued: int = 0
+    """``transcript_mirror`` frames passed to ``enqueue()``."""
+    entries_enqueued: int = 0
+    """Transcript entries contained in those frames."""
+    flushes: int = 0
+    """Drains (explicit ``flush()``/``close()`` or eager) that had frames."""
+    entries_flushed: int = 0
+    """Entries delivered by a successful ``store.append()``."""
+    batches_failed: int = 0
+    """Per-key batches dropped once the retry/timeout budget was exhausted."""
+    entries_dropped: int = 0
+    """Entries in those dropped batches (each is reported via ``on_error``)."""
+
+
 @dataclass
 class TranscriptMirrorBatcher:
     """Accumulates ``transcript_mirror`` frames and flushes them to a store.
@@ -74,8 +103,38 @@ class TranscriptMirrorBatcher:
     _flush_task: TaskHandle | None = None
     _lock: anyio.Lock = field(default_factory=anyio.Lock)
 
+    # Lifetime counters behind the ``stats`` property. Only ever mutated
+    # synchronously (no await between read and write), so concurrent drains
+    # on one event loop cannot lose updates.
+    _frames_enqueued: int = field(default=0, init=False, repr=False)
+    _entries_enqueued: int = field(default=0, init=False, repr=False)
+    _flushes: int = field(default=0, init=False, repr=False)
+    _entries_flushed: int = field(default=0, init=False, repr=False)
+    _batches_failed: int = field(default=0, init=False, repr=False)
+    _entries_dropped: int = field(default=0, init=False, repr=False)
+
+    @property
+    def stats(self) -> MirrorStats:
+        """Snapshot of the batcher's lifetime counters.
+
+        Every read returns a new frozen :class:`MirrorStats`; a snapshot is
+        never updated by later activity. Cheap enough to poll after each
+        ``ResultMessage`` or at ``close()`` to decide whether a
+        ``sync_session_to_store()`` catch-up is warranted.
+        """
+        return MirrorStats(
+            frames_enqueued=self._frames_enqueued,
+            entries_enqueued=self._entries_enqueued,
+            flushes=self._flushes,
+            entries_flushed=self._entries_flushed,
+            batches_failed=self._batches_failed,
+            entries_dropped=self._entries_dropped,
+        )
+
     def enqueue(self, file_path: str, entries: list[SessionStoreEntry]) -> None:
         """Buffer a frame; schedule an eager flush if thresholds are exceeded."""
+        self._frames_enqueued += 1
+        self._entries_enqueued += len(entries)
         # Approximate wire size — one stringify per frame (not per entry) keeps
         # this cheap relative to the json.loads the transport already did.
         size = len(json.dumps(entries))
@@ -126,6 +185,7 @@ class TranscriptMirrorBatcher:
         async with self._lock:
             if not items:
                 return
+            self._flushes += 1
             try:
                 await self._do_flush(items, errors)
             except Exception as e:  # pragma: no cover - defensive
@@ -184,6 +244,7 @@ class TranscriptMirrorBatcher:
                     with anyio.fail_after(self.send_timeout):
                         await self.store.append(key, entries)
                     succeeded = True
+                    self._entries_flushed += len(entries)
                     break
                 except TimeoutError as e:
                     # Don't retry on timeout: the cancel scope cancels the
@@ -211,6 +272,8 @@ class TranscriptMirrorBatcher:
                         e,
                     )
             if not succeeded:
+                self._batches_failed += 1
+                self._entries_dropped += len(entries)
                 logger.error(
                     "[TranscriptMirrorBatcher] flush failed for %s: %s",
                     file_path,

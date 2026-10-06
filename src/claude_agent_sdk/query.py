@@ -72,6 +72,17 @@ async def query(
     Yields:
         Messages from the conversation
 
+    Raises:
+        ValueError: If ``options`` combine settings the SDK cannot honor, for
+            example ``resume`` together with ``continue_conversation``,
+            ``session_id`` with ``resume`` but without ``fork_session``,
+            ``resume_session_at`` without ``resume``, a negative ``max_turns``
+            or ``max_budget_usd``, an SDK MCP server config without an
+            ``instance``, or a non-local plugin. The check runs before the
+            Claude Code CLI is started (and before any ``session_store`` is
+            read), so a misconfiguration fails fast instead of surfacing as a
+            CLI error mid-session.
+
     Examples:
         Simple query:
         ```python

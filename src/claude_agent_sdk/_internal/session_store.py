@@ -1,4 +1,10 @@
-"""In-memory reference implementation of :class:`SessionStore`."""
+"""In-memory reference implementation of :class:`SessionStore`.
+
+:class:`InMemorySessionStore` is the reference for the storage-clock (``mtime``)
+and summary-sidecar semantics every adapter must follow. For a durable,
+dependency-free store with the same semantics see
+:class:`claude_agent_sdk.stores.SQLiteSessionStore`.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +43,9 @@ class InMemorySessionStore(SessionStore):
 
     Stores entries in a ``dict`` keyed by a composite ``project_key/session_id``
     string (with an optional ``/subpath`` suffix). Not suitable for production —
-    data is lost when the process exits.
+    data is lost when the process exits. Use
+    :class:`claude_agent_sdk.stores.SQLiteSessionStore` for a durable store
+    that needs no extra dependencies.
     """
 
     def __init__(self) -> None:

@@ -9,8 +9,15 @@ Reference [`SessionStore`](../../src/claude_agent_sdk/types.py) implementations
 These adapters live in `examples/` (not `src/`) so the SDK package stays free
 of heavyweight optional dependencies. They are imported and exercised by the
 test suite to prove the `SessionStore` protocol generalizes beyond the
-in-memory default. Each adapter here passes the full 13-contract conformance
-suite.
+in-memory default. Each adapter here passes the shipped conformance harness
+(`run_session_store_conformance`, 14 contracts; the `list_session_summaries`
+contract is skipped for these adapters because they do not implement that
+optional method, so `list_sessions_from_store()` falls back to
+`list_sessions()` + per-session `load()` for them).
+
+If you want a durable store without a third-party client, the SDK ships
+`SQLiteSessionStore` in `claude_agent_sdk.stores` (standard-library `sqlite3`);
+see the "Session stores" section of the top-level README.
 
 ## Validating your own adapter
 
@@ -21,6 +28,7 @@ harness:
 ```python
 import pytest
 from claude_agent_sdk.testing import run_session_store_conformance
+
 
 @pytest.mark.anyio
 async def test_my_store_conformance():

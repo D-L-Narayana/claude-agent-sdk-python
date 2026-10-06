@@ -1,5 +1,10 @@
 """Tests for Claude SDK error handling."""
 
+import copy
+import pickle
+
+import pytest
+
 from claude_agent_sdk import (
     ClaudeSDKError,
     CLIConnectionError,
@@ -8,6 +13,11 @@ from claude_agent_sdk import (
     ProcessError,
     ResultError,
 )
+from claude_agent_sdk._errors import ControlRequestError, ControlRequestTimeoutError
+
+
+class _CustomTimeoutError(ControlRequestTimeoutError):
+    """Module-level subclass so pickle can import it by qualified name."""
 
 
 class TestErrorTypes:
@@ -110,3 +120,102 @@ class TestErrorTypes:
             assert error.line == "{invalid json}"
             assert error.original_error == e
             assert "Failed to decode JSON" in str(error)
+
+
+class TestControlRequestErrors:
+    """Typed errors for the control protocol (timeouts, CLI error responses)."""
+
+    def test_hierarchy(self):
+        error = ControlRequestError("boom")
+        assert isinstance(error, ClaudeSDKError)
+        assert isinstance(error, Exception)
+        # Not a process failure: the CLI is alive, it just refused the request.
+        assert not isinstance(error, ProcessError)
+
+        timeout = ControlRequestTimeoutError(
+            "Control request timeout: interrupt", timeout=60.0
+        )
+        assert isinstance(timeout, ControlRequestError)
+        assert isinstance(timeout, ClaudeSDKError)
+
+    def test_attributes_default_to_none(self):
+        error = ControlRequestError("boom")
+        assert str(error) == "boom"
+        assert error.args == ("boom",)
+        assert error.subtype is None
+        assert error.request_id is None
+
+    def test_attributes(self):
+        error = ControlRequestError(
+            "Model 'nope' is not available",
+            subtype="set_model",
+            request_id="req_3_0a1b2c3d",
+        )
+        # The message is the CLI's error text, undecorated.
+        assert str(error) == "Model 'nope' is not available"
+        assert error.subtype == "set_model"
+        assert error.request_id == "req_3_0a1b2c3d"
+
+    def test_timeout_error_attributes(self):
+        error = ControlRequestTimeoutError(
+            "Control request timeout: initialize",
+            timeout=60.0,
+            subtype="initialize",
+            request_id="req_1_deadbeef",
+        )
+        assert str(error) == "Control request timeout: initialize"
+        assert error.timeout == 60.0
+        assert error.subtype == "initialize"
+        assert error.request_id == "req_1_deadbeef"
+
+    def test_optional_fields_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            ControlRequestError("boom", "set_model")  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            ControlRequestTimeoutError("boom", 1.0)  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            ControlRequestTimeoutError("boom")  # type: ignore[call-arg]
+
+    def test_control_request_error_survives_pickle_and_copy(self):
+        """Exceptions cross process boundaries via pickle (multiprocessing,
+        ProcessPoolExecutor); the typed fields must round-trip."""
+        error = ControlRequestError("boom", subtype="set_model", request_id="req_7")
+        for clone in (
+            pickle.loads(pickle.dumps(error)),
+            copy.copy(error),
+            copy.deepcopy(error),
+        ):
+            assert type(clone) is ControlRequestError
+            assert str(clone) == "boom"
+            assert clone.subtype == "set_model"
+            assert clone.request_id == "req_7"
+
+    def test_timeout_error_survives_pickle_and_copy(self):
+        """``timeout`` is a required keyword, so the default exception
+        reconstruction (``type(e)(*e.args)``) would not do; it must still
+        round-trip with every field."""
+        error = ControlRequestTimeoutError(
+            "Control request timeout: set_model",
+            timeout=12.5,
+            subtype="set_model",
+            request_id="req_8",
+        )
+        for clone in (
+            pickle.loads(pickle.dumps(error)),
+            copy.copy(error),
+            copy.deepcopy(error),
+        ):
+            assert type(clone) is ControlRequestTimeoutError
+            assert str(clone) == "Control request timeout: set_model"
+            assert clone.timeout == 12.5
+            assert clone.subtype == "set_model"
+            assert clone.request_id == "req_8"
+
+    def test_timeout_error_subclass_survives_pickle(self):
+        error = _CustomTimeoutError("late", timeout=1.0, subtype="interrupt")
+        clone = pickle.loads(pickle.dumps(error))
+        assert type(clone) is _CustomTimeoutError
+        assert str(clone) == "late"
+        assert clone.timeout == 1.0
+        assert clone.subtype == "interrupt"
+        assert clone.request_id is None

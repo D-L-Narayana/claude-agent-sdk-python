@@ -1,29 +1,9 @@
 """Claude SDK for Python."""
 
 import logging
-import sys
-import types as builtin_types
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Annotated,
-    Any,
-    Generic,
-    TypeVar,
-    Union,
-    get_args,
-    get_origin,
-)
-
-if sys.version_info >= (3, 11):
-    from typing import get_type_hints as _get_type_hints
-    from typing import is_typeddict
-else:
-    # On 3.10, stdlib is_typeddict doesn't recognize typing_extensions.TypedDict
-    # subclasses, and stdlib get_type_hints doesn't strip NotRequired markers.
-    from typing_extensions import get_type_hints as _get_type_hints
-    from typing_extensions import is_typeddict
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import jsonschema
 from mcp.types import CallToolResult, Tool
@@ -34,11 +14,24 @@ from ._errors import (
     CLIConnectionError,
     CLIJSONDecodeError,
     CLINotFoundError,
+    ControlRequestError,
+    ControlRequestTimeoutError,
     ProcessError,
     ResultError,
 )
 from ._internal._mcp_compat import build_tool_server
-from ._internal.session_import import import_session_to_store
+from ._internal._schema import (
+    build_input_schema,
+    python_type_to_json_schema,
+    typeddict_to_json_schema,
+)
+from ._internal.abort_signal import AbortSignal
+from ._internal.session_export import export_session_from_store
+from ._internal.session_import import (
+    SessionSyncReport,
+    import_session_to_store,
+    sync_session_to_store,
+)
 from ._internal.session_mutations import (
     ForkSessionResult,
     delete_session,
@@ -63,19 +56,24 @@ from ._internal.sessions import (
     list_sessions_from_store,
     list_subagents,
     list_subagents_from_store,
+    to_sdk_message,
 )
+from ._internal.transcript_mirror_batcher import MirrorStats
 from ._internal.transport import Transport
 from ._version import __version__
 from .client import ClaudeSDKClient
 from .query import query
+from .stores import SQLiteSessionStore
 from .types import (
     TERMINAL_TASK_STATUSES,
     AgentDefinition,
     AssistantMessage,
+    AuthStatusMessage,
     BaseHookInput,
     CanUseTool,
     CanUseToolShadowedWarning,
     ClaudeAgentOptions,
+    CompactBoundaryMessage,
     ContentBlock,
     ContextUsageCategory,
     ContextUsageResponse,
@@ -88,6 +86,7 @@ from .types import (
     HookInput,
     HookJSONOutput,
     HookMatcher,
+    InitMessage,
     McpSdkServerConfig,
     McpServerConfig,
     McpServerConnectionStatus,
@@ -120,6 +119,7 @@ from .types import (
     RateLimitInfo,
     RateLimitStatus,
     RateLimitType,
+    RedactedThinkingBlock,
     ResultMessage,
     SandboxIgnoreViolations,
     SandboxNetworkConfig,
@@ -139,6 +139,7 @@ from .types import (
     SessionStoreListEntry,
     SessionSummaryEntry,
     SettingSource,
+    StatusMessage,
     StopHookInput,
     StreamEvent,
     SubagentStartHookInput,
@@ -161,8 +162,11 @@ from .types import (
     ThinkingConfigDisabled,
     ThinkingConfigEnabled,
     ToolPermissionContext,
+    ToolProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseSummaryMessage,
+    UnknownBlock,
     UserMessage,
     UserPromptSubmitHookInput,
 )
@@ -271,7 +275,13 @@ def tool(
             - A TypedDict class for more complex schemas
             - A JSON Schema dictionary for full validation
             Use ``Annotated[type, "description"]`` to add a description to a
-            parameter in either dict-style or TypedDict schemas.
+            parameter in either dict-style or TypedDict schemas. Besides
+            ``str``/``int``/``float``/``bool``, the converter understands
+            ``X | None`` / ``Optional[X]``, ``Literal[...]`` and ``Enum``
+            subclasses, ``list[X]`` / ``tuple`` / ``set[X]`` / ``dict[str, X]``,
+            nested TypedDicts (with ``NotRequired``), ``datetime``, ``date``,
+            ``time``, ``UUID`` and ``Decimal``; anything else is sent as a
+            string (see ``_internal/_schema.py`` for the exact mapping).
         annotations: Optional MCP tool annotations (hints such as
             ``readOnlyHint`` or ``destructiveHint``) advertised to Claude.
             ``ToolAnnotations(maxResultSizeChars=N)`` additionally raises the
@@ -335,99 +345,15 @@ def tool(
     return decorator
 
 
-def _python_type_to_json_schema(py_type: Any) -> dict[str, Any]:
-    """Convert a Python type annotation to a JSON Schema dict."""
-    origin = get_origin(py_type)
-
-    # NotRequired/Required/ReadOnly survive include_extras=True; unwrap them
-    if getattr(origin, "_name", None) in ("NotRequired", "Required", "ReadOnly"):
-        return _python_type_to_json_schema(get_args(py_type)[0])
-
-    if origin is Annotated:
-        args = get_args(py_type)
-        schema = _python_type_to_json_schema(args[0])
-        for meta in args[1:]:
-            if isinstance(meta, str):
-                schema["description"] = meta
-                break
-        return schema
-
-    if py_type is str:
-        return {"type": "string"}
-    if py_type is int:
-        return {"type": "integer"}
-    if py_type is float:
-        return {"type": "number"}
-    if py_type is bool:
-        return {"type": "boolean"}
-
-    origin = getattr(py_type, "__origin__", None)
-
-    if origin is Union or isinstance(py_type, builtin_types.UnionType):
-        args = py_type.__args__
-        non_none = [a for a in args if a is not builtin_types.NoneType]
-        if len(non_none) == 1:
-            return _python_type_to_json_schema(non_none[0])
-        return {"anyOf": [_python_type_to_json_schema(a) for a in non_none]}
-
-    if origin is list:
-        item_args = getattr(py_type, "__args__", None)
-        if item_args:
-            return {"type": "array", "items": _python_type_to_json_schema(item_args[0])}
-        return {"type": "array"}
-    if origin is dict:
-        return {"type": "object"}
-
-    if py_type is list:
-        return {"type": "array"}
-    if py_type is dict:
-        return {"type": "object"}
-
-    if is_typeddict(py_type):
-        return _typeddict_to_json_schema(py_type)
-
-    return {"type": "string"}
-
-
-def _typeddict_to_json_schema(td_class: type) -> dict[str, Any]:
-    """Convert a TypedDict class to a JSON Schema dict."""
-    hints = _get_type_hints(td_class, include_extras=True)
-
-    properties: dict[str, Any] = {}
-    for field_name, field_type in hints.items():
-        properties[field_name] = _python_type_to_json_schema(field_type)
-
-    required_keys = getattr(td_class, "__required_keys__", set(properties.keys()))
-    schema: dict[str, Any] = {
-        "type": "object",
-        "properties": properties,
-    }
-    if required_keys:
-        schema["required"] = sorted(required_keys)
-    return schema
+# Python-type -> JSON Schema conversion lives in ``_internal._schema``; these
+# private names are kept for backwards compatibility with existing imports.
+_python_type_to_json_schema = python_type_to_json_schema
+_typeddict_to_json_schema = typeddict_to_json_schema
 
 
 def _build_input_schema(tool_def: SdkMcpTool[Any]) -> dict[str, Any]:
     """Turn a tool's declared input_schema into the JSON Schema sent on the wire."""
-    if isinstance(tool_def.input_schema, dict):
-        if (
-            "type" in tool_def.input_schema
-            and "properties" in tool_def.input_schema
-            and isinstance(tool_def.input_schema["type"], str)
-        ):
-            return tool_def.input_schema
-        properties = {
-            param_name: _python_type_to_json_schema(param_type)
-            for param_name, param_type in tool_def.input_schema.items()
-        }
-        return {
-            "type": "object",
-            "properties": properties,
-            "required": list(properties.keys()),
-        }
-    if is_typeddict(tool_def.input_schema):
-        return _typeddict_to_json_schema(tool_def.input_schema)
-    return {"type": "object", "properties": {}}
+    return build_input_schema(tool_def.input_schema)
 
 
 def _build_meta(tool_def: SdkMcpTool[Any]) -> dict[str, Any] | None:
@@ -552,10 +478,14 @@ def create_sdk_mcp_server(
         >>> server = create_sdk_mcp_server("store", tools=[add_item])
 
         Bringing your own server: any ``mcp.server.Server`` built with the
-        installed ``mcp`` package can be used in place of this helper, and
-        the requests it handles (tools, resources, prompts, ...) are served.
-        Requests and notifications the server sends to the client (sampling,
-        elicitation, roots, logging, progress) are not forwarded yet:
+        installed ``mcp`` package can be used in place of this helper, as can
+        a server built with the high-level class (``FastMCP`` on mcp 1.x,
+        ``MCPServer`` on mcp 2.x) -- the SDK serves the lowlevel server it
+        wraps -- and the requests it handles (tools, resources, prompts, ...)
+        are served. Requests the server sends to the client (sampling,
+        elicitation, roots) are refused; its log messages are forwarded to
+        the Python logger ``claude_agent_sdk.mcp.<server name>`` and progress
+        notifications are logged there at DEBUG:
         >>> from mcp.server import Server
         >>> my_server = Server("mine")  # register handlers with the mcp API
         >>> config = McpSdkServerConfig(type="sdk", name="mine", instance=my_server)
@@ -658,6 +588,12 @@ __all__ = [
     "RateLimitType",
     "StreamEvent",
     "ConversationResetMessage",
+    "InitMessage",
+    "CompactBoundaryMessage",
+    "StatusMessage",
+    "ToolProgressMessage",
+    "ToolUseSummaryMessage",
+    "AuthStatusMessage",
     "Message",
     "MessageOrigin",
     "MessageOriginKind",
@@ -675,6 +611,8 @@ __all__ = [
     "ServerToolName",
     "ServerToolUseBlock",
     "ServerToolResultBlock",
+    "RedactedThinkingBlock",
+    "UnknownBlock",
     "ContentBlock",
     "ContextUsageCategory",
     "ContextUsageResponse",
@@ -686,6 +624,7 @@ __all__ = [
     "PermissionResultAllow",
     "PermissionResultDeny",
     "PermissionUpdate",
+    "AbortSignal",
     # Hook support
     "HookCallback",
     "HookContext",
@@ -730,10 +669,16 @@ __all__ = [
     "SessionSummaryEntry",
     "SessionListSubkeysKey",
     "InMemorySessionStore",
+    "SQLiteSessionStore",
+    "MirrorStats",
     "fold_session_summary",
     "MirrorErrorMessage",
     "project_key_for_directory",
     "import_session_to_store",
+    "sync_session_to_store",
+    "SessionSyncReport",
+    "export_session_from_store",
+    "to_sdk_message",
     # Session listing (SessionStore-backed async variants)
     "list_sessions_from_store",
     "get_session_info_from_store",
@@ -768,5 +713,7 @@ __all__ = [
     "CLINotFoundError",
     "ProcessError",
     "ResultError",
+    "ControlRequestError",
+    "ControlRequestTimeoutError",
     "CLIJSONDecodeError",
 ]
