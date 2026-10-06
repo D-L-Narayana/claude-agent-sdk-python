@@ -1,10 +1,18 @@
 name: Test
 
+# workflow_dispatch is a manual fallback that runs the OFFLINE jobs only
+# (test, test-mcp-v1-floor, test-min-python). Under a manual event the
+# real-API jobs (test-e2e, test-e2e-docker, test-examples) are skipped by
+# their gate even when the federation variables are configured, so a green
+# manual run proves the offline suite, not real-API validation. It does not
+# diagnose or repair a missing automatic run; the automatic triggers below
+# are unchanged.
 on:
   pull_request:
   push:
     branches:
       - "main"
+  workflow_dispatch:
 
 jobs:
   test:

@@ -92,4 +92,18 @@ end-to-end tests or the example scripts ran against the API. Before publishing, 
 run you are releasing from executed those jobs (they appear as completed, not skipped). The
 gate logic itself is checked by `tests/test_workflow_gates.py`, which parses the workflow
 with PyYAML (part of the `dev` extra) and evaluates each job's `if` expression under push,
-same-repository PR, external PR and missing-configuration scenarios.
+same-repository PR, external PR, missing-configuration and manual-dispatch scenarios.
+
+## Manual offline verification (fallback)
+
+The `Test` and `Lint` workflows can also be started by hand (**Actions → Test / Lint →
+Run workflow**, `workflow_dispatch`, no inputs). This is a fallback for checking a commit
+when no automatic run appeared for it: a manual run executes the offline jobs only — the
+unit suite on the newest Python, the oldest supported `mcp`, the minimum Python, and
+lint/type checks. The real-API jobs (`test-e2e`, `test-e2e-docker`, `test-examples`) are
+skipped under a manual event even when the workload-identity variables are configured, so
+a green manual run is evidence that the offline suite and lint passed, **not** that the
+end-to-end tests or example scripts ran against the API, and it does not explain or repair
+a missing automatic run — investigate that separately before publishing. The publishing,
+release, notification and Claude-assistant workflows deliberately have no such manual
+entry point beyond what they already had (`publish.yml` is manual by design).

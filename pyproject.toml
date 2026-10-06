@@ -75,9 +75,11 @@ include = [
     # /tests without /scripts cannot even collect its own test suite.
     "/scripts",
     "/examples",
-    # tests/test_workflow_gates.py parses this workflow to check the
-    # Claude-API job gates, so the shipped test suite needs the file too.
-    "/.github/workflows/test.yml",
+    # tests/test_workflow_gates.py parses the workflow files (the Test and
+    # Lint gates and triggers, and the trigger inventory of the others), so
+    # the shipped test suite needs them too. They reference secrets and
+    # variables by name only.
+    "/.github/workflows",
     # tests/test_changelog.py checks the changelog's format from the shipped
     # suite as well.
     "/CHANGELOG.md",

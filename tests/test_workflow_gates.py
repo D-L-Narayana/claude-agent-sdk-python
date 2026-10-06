@@ -27,7 +27,25 @@ from typing import Any
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "test.yml"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+WORKFLOW_PATH = WORKFLOWS_DIR / "test.yml"
+LINT_WORKFLOW_PATH = WORKFLOWS_DIR / "lint.yml"
+
+# A manual run of Test or Lint is a fallback that verifies the offline jobs
+# only (see TestManualDispatch). These workflows must not grow that button:
+# they react to events, or are callable only, and run on demand they would
+# publish, spend API credit or post to Slack. publish.yml and
+# pypi-quota-check.yml have offered workflow_dispatch all along.
+MANUAL_EVENT = "workflow_dispatch"
+NO_MANUAL_DISPATCH = (
+    "auto-release.yml",
+    "build-and-publish.yml",
+    "build-wheel-check.yml",
+    "claude.yml",
+    "claude-code-review.yml",
+    "claude-issue-triage.yml",
+    "slack-issue-notification.yml",
+)
 
 # The jobs that call the Claude API, and so need the auth action and its
 # configuration; and the jobs that run offline and must never be gated.
@@ -325,6 +343,18 @@ def _permission_scopes(node: dict[str, Any]) -> set[str]:
     return {"id-token"} if permissions == "write-all" else set()
 
 
+def triggers(document: dict[str, Any]) -> dict[str, Any]:
+    """The workflow's ``on`` block, as a mapping of event name to settings.
+
+    A YAML 1.1 parser (PyYAML) reads the bare key ``on`` as the boolean True;
+    a YAML 1.2 parser (Bun.YAML) keeps the string "on". Accept either, so the
+    tests do not depend on which parser loaded the file.
+    """
+    block = document["on"] if "on" in document else document.get(True)
+    assert isinstance(block, dict), f"trigger block is {block!r}, not a mapping"
+    return block
+
+
 @pytest.fixture(scope="module")
 def workflow() -> dict[str, Any]:
     return load_workflow(WORKFLOW_PATH)
@@ -334,6 +364,11 @@ def workflow() -> dict[str, Any]:
 def jobs(workflow: dict[str, Any]) -> dict[str, Any]:
     assert isinstance(workflow.get("jobs"), dict), "workflow has no jobs mapping"
     return workflow["jobs"]
+
+
+@pytest.fixture(scope="module")
+def lint_workflow() -> dict[str, Any]:
+    return load_workflow(LINT_WORKFLOW_PATH)
 
 
 class TestExpressionSemantics:
@@ -545,3 +580,80 @@ class TestGate:
             event="push", repository=UPSTREAM, variables={**CONFIGURED, blank: ""}
         )
         assert not job_runs(jobs[job_name], context)
+
+
+class TestManualDispatch:
+    """A manual run of Test or Lint verifies the offline suite, nothing more.
+
+    ``workflow_dispatch`` on these two workflows is a fallback for when no run
+    was started automatically: it exercises the offline jobs and the lint job
+    on a chosen ref. It is not a way to run the real-API jobs -- their gate
+    admits pushes and same-repository pull requests only, so under a manual
+    event they are skipped even with the federation variables configured --
+    and it says nothing about why an automatic run did not happen.
+    """
+
+    @pytest.fixture(params=["workflow", "lint_workflow"], ids=["test.yml", "lint.yml"])
+    def manual_workflow(self, request: pytest.FixtureRequest) -> dict[str, Any]:
+        document: dict[str, Any] = request.getfixturevalue(request.param)
+        return document
+
+    def test_offers_a_manual_run_without_inputs(
+        self, manual_workflow: dict[str, Any]
+    ) -> None:
+        block = triggers(manual_workflow)
+        assert MANUAL_EVENT in block
+
+        # No value, or settings without inputs: a verification run must not
+        # ask for anything.
+        inputs = (block[MANUAL_EVENT] or {}).get("inputs") or {}
+        assert inputs == {}, "a manual verification run must need no inputs"
+
+    def test_automatic_triggers_are_unchanged(
+        self, manual_workflow: dict[str, Any]
+    ) -> None:
+        """The manual trigger is added next to the automatic ones, which stay
+        exactly as they were: every pull request, and pushes to main."""
+        block = triggers(manual_workflow)
+        assert "pull_request" in block
+        assert block["push"] == {"branches": ["main"]}
+
+    @pytest.mark.parametrize("job_name", GATED_JOBS)
+    def test_real_api_job_is_skipped_under_a_manual_event(
+        self, jobs: dict[str, Any], job_name: str
+    ) -> None:
+        """Pins existing behavior rather than changing it: the gate's event
+        clause -- a push, or a same-repository pull request -- already
+        excludes workflow_dispatch, whether or not the variables are set. A
+        green manual run is therefore never real-API validation."""
+        context = _context(
+            event=MANUAL_EVENT, repository=UPSTREAM, variables=CONFIGURED
+        )
+        assert not job_runs(jobs[job_name], context)
+
+    @pytest.mark.parametrize("job_name", OFFLINE_JOBS)
+    def test_offline_job_runs_under_a_manual_event(
+        self, jobs: dict[str, Any], job_name: str
+    ) -> None:
+        """Ungated, so a manual event runs them -- with no configuration and
+        without requesting an identity token."""
+        context = _context(event=MANUAL_EVENT, repository=UPSTREAM, variables={})
+        assert job_runs(jobs[job_name], context)
+        assert "id-token" not in _permission_scopes(jobs[job_name])
+
+    def test_lint_job_runs_under_a_manual_event(
+        self, lint_workflow: dict[str, Any]
+    ) -> None:
+        lint_jobs = lint_workflow["jobs"]
+        assert set(lint_jobs) == {"lint"}
+
+        context = _context(event=MANUAL_EVENT, repository=UPSTREAM, variables={})
+        assert job_runs(lint_jobs["lint"], context)
+        assert "id-token" not in _permission_scopes(lint_workflow)
+        assert "id-token" not in _permission_scopes(lint_jobs["lint"])
+
+    @pytest.mark.parametrize("name", NO_MANUAL_DISPATCH)
+    def test_other_workflows_offer_no_manual_run(self, name: str) -> None:
+        """Pins the trigger inventory of the workflows that must stay
+        event-driven or callable-only (see NO_MANUAL_DISPATCH)."""
+        assert MANUAL_EVENT not in triggers(load_workflow(WORKFLOWS_DIR / name))

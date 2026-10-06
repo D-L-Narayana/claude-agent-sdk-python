@@ -1,10 +1,17 @@
 name: Lint
 
+# workflow_dispatch is a manual fallback that runs this OFFLINE lint job on a
+# chosen ref: ruff and mypy, nothing that reaches the Claude API. A green
+# manual run proves lint and types, not real-API validation (the Test
+# workflow's real-API jobs are skipped under a manual event too). It does not
+# diagnose or repair a missing automatic run; the automatic triggers below
+# are unchanged.
 on:
   pull_request:
   push:
     branches:
       - 'main'
+  workflow_dispatch:
 
 jobs:
   lint:
